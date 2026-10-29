@@ -9,7 +9,7 @@ Debudaj-Grabysz), format compatible with it.
 ### Breaking Changes
 - None (archives are interchangeable with CoMSA 1.1)
 ### Added
-- `comsa` command-line tool with the same modes and options as CoMSA 1.1
+- `comsa-rs` command-line tool with the same modes and options as CoMSA 1.1
   (`Sc`, `Sd`, `Se`, `Sl`, `Fc`, `Fd`, `-f`, `-w`, `-eID`, `-eAC`, `@list`)
 - `-t <threads>`: families are compressed and decompressed in parallel, and large
   alignments are also pipelined internally

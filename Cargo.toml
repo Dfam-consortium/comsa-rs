@@ -1,6 +1,6 @@
 [package]
-name = "comsa"
-version = "0.1.0"
+name = "comsa-rs"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.85"
 description = "Compressor for multiple sequence alignments (Stockholm and aligned FASTA); Rust port of CoMSA 1.1"
@@ -16,7 +16,7 @@ name = "comsa"
 path = "src/lib.rs"
 
 [[bin]]
-name = "comsa"
+name = "comsa-rs"
 path = "src/main.rs"
 
 [dependencies]

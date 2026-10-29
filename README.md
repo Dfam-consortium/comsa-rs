@@ -47,8 +47,8 @@ Download the archive for your platform (Linux x86_64 or macOS arm64) from the
 [releases page](https://github.com/Dfam-consortium/comsa-rs/releases) and unpack it:
 
 ```sh
-tar xzf comsa-<version>-<target>.tar.gz
-comsa-<version>/bin/comsa --version
+tar xzf comsa-rs-<version>-<target>.tar.gz
+comsa-rs-<version>/bin/comsa-rs --version
 ```
 
 ### From source
@@ -59,26 +59,32 @@ Requires a Rust toolchain (<https://rustup.rs>, Rust 1.85 or newer) and a C comp
 ```sh
 git clone https://github.com/Dfam-consortium/comsa-rs.git
 cd comsa-rs
-make                         # target/release/comsa
+make                         # target/release/comsa-rs
 make test                    # optional
-make install PREFIX=/opt     # installs /opt/comsa-<version>/bin/comsa and docs
+make install PREFIX=/opt     # installs /opt/comsa-rs-<version>/bin/comsa-rs and docs
 ```
 
-or simply `cargo install --git https://github.com/Dfam-consortium/comsa-rs`.
+The binary is `comsa-rs`; `make install` and the release archives also include a
+`comsa` symlink to it, so scripts written for the old name keep working.
+
+or simply `cargo install --git https://github.com/Dfam-consortium/comsa-rs` (this
+installs only `comsa-rs`, without the `comsa` symlink).
 
 ### As a library
 
 ```toml
 [dependencies]
-comsa = { git = "https://github.com/Dfam-consortium/comsa-rs" }
+comsa-rs = { git = "https://github.com/Dfam-consortium/comsa-rs" }
 ```
+
+The library itself is still named `comsa`, so code imports it with `use comsa::...`.
 
 ## Usage
 
 The command line is the same as CoMSA's, with `-t` and `--version` added.
 
 ```text
-comsa <mode> [options] <in_file> <out_file>
+comsa-rs <mode> [options] <in_file> <out_file>
 
 Modes:
   Sc   compress Stockholm file(s) into an archive (.smsac)
@@ -100,12 +106,12 @@ Options:
 Examples:
 
 ```sh
-comsa Sc Dfam.seed.sto Dfam.seed.smsac
-comsa Sc @stockholm_files.txt families.smsac
-comsa Sl Dfam.seed.smsac | head
-comsa Se -eAC DF000000001.4 Dfam.seed.smsac MIR.sto
-comsa Sd Dfam.seed.smsac Dfam.seed.sto
-comsa Fc PF00005.fasta PF00005.msac && comsa Fd -w 60 PF00005.msac PF00005.fasta
+comsa-rs Sc Dfam.seed.sto Dfam.seed.smsac
+comsa-rs Sc @stockholm_files.txt families.smsac
+comsa-rs Sl Dfam.seed.smsac | head
+comsa-rs Se -eAC DF000000001.4 Dfam.seed.smsac MIR.sto
+comsa-rs Sd Dfam.seed.smsac Dfam.seed.sto
+comsa-rs Fc PF00005.fasta PF00005.msac && comsa-rs Fd -w 60 PF00005.msac PF00005.fasta
 ```
 
 Any failure exits with status 1 and removes the partial output file.
@@ -163,7 +169,7 @@ On the Dfam sample, single-threaded comsa-rs (`-t 1`) decompresses in 131 s.
 
 Compression ratios are identical for all three implementations:
 
-| Data set | comsa | `xz -9` | `gzip -9` |
+| Data set | comsa-rs | `xz -9` | `gzip -9` |
 |---|---|---|---|
 | Pfam sample | 15.6× | 13.9× | – |
 | Dfam sample (3.43 GB → 67.6 MB) | 50.7× (13.5 s) | 44.3× (83.5 s, 16 threads) | 20.8× (564 s) |

@@ -34,8 +34,8 @@ struct Args {
 
 fn usage() {
     eprintln!(
-        "Usage: comsa <mode> [options] <in_file> <out_file>
-       comsa <mode> [options] @<in_file_list> <out_file>
+        "Usage: comsa-rs <mode> [options] <in_file> <out_file>
+       comsa-rs <mode> [options] @<in_file_list> <out_file>
 Modes:
    Fc - compress FASTA file           Fd - decompress FASTA file
    Sc - compress Stockholm file(s)    Sd - decompress Stockholm archive
@@ -50,17 +50,17 @@ Options:
    @file       file with one Stockholm file name per line (Sc only)
    --version   print the version and exit
 Examples:
-   comsa Sc pfam.sto pfam.smsac
-   comsa Sd pfam.smsac pfam.sto
-   comsa Se -eAC PF00005.26 pfam.smsac PF00005.sto
-   comsa Fd -w 60 PF00005.msac PF00005.fasta"
+   comsa-rs Sc pfam.sto pfam.smsac
+   comsa-rs Sd pfam.smsac pfam.sto
+   comsa-rs Se -eAC PF00005.26 pfam.smsac PF00005.sto
+   comsa-rs Fd -w 60 PF00005.msac PF00005.fasta"
     );
 }
 
 fn parse_args() -> std::result::Result<Args, String> {
     let argv: Vec<String> = std::env::args().skip(1).collect();
     if matches!(argv.first().map(String::as_str), Some("-version" | "--version" | "-V")) {
-        println!("comsa {}", env!("CARGO_PKG_VERSION"));
+        println!("comsa-rs {}", env!("CARGO_PKG_VERSION"));
         std::process::exit(0);
     }
     let mode = match argv.first().map(String::as_str) {
@@ -243,7 +243,7 @@ fn main() -> ExitCode {
         Ok(a) => a,
         Err(msg) => {
             if !msg.is_empty() {
-                eprintln!("comsa: {msg}");
+                eprintln!("comsa-rs: {msg}");
             }
             usage();
             return ExitCode::from(2);
@@ -260,7 +260,7 @@ fn main() -> ExitCode {
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("\ncomsa: {e}");
+            eprintln!("\ncomsa-rs: {e}");
             // Don't leave a partial output file behind.
             if OUTPUT_CREATED.load(Ordering::Relaxed) && Path::new(&args.output).is_file() {
                 let _ = std::fs::remove_file(&args.output);

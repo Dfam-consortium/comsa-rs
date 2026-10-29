@@ -72,19 +72,24 @@ jobs:
         run: |
           make dist PREFIX=/staging DESTDIR="${PWD}/stage"
           VERSION="$(make version)"
-          ARCHIVE="comsa-${VERSION}-${{ matrix.target }}.tar.gz"
-          mv "comsa-${VERSION}.tar.gz" "${ARCHIVE}"
+          ARCHIVE="comsa-rs-${VERSION}-${{ matrix.target }}.tar.gz"
+          mv "comsa-rs-${VERSION}.tar.gz" "${ARCHIVE}"
           echo "ARCHIVE=${ARCHIVE}" >> "${GITHUB_ENV}"
 
       - name: Smoke-test the packaged binary
         shell: bash
         run: |
           VERSION="$(make version)"
-          BIN="stage/staging/comsa-${VERSION}/bin/comsa"
+          BIN="stage/staging/comsa-rs-${VERSION}/bin/comsa-rs"
           OUT="$("${BIN}" --version)"
           echo "${OUT}"
-          if [ "${OUT}" != "comsa ${VERSION}" ]; then
-            echo "comsa reports '${OUT}', expected 'comsa ${VERSION}'" >&2
+          if [ "${OUT}" != "comsa-rs ${VERSION}" ]; then
+            echo "comsa-rs reports '${OUT}', expected 'comsa-rs ${VERSION}'" >&2
+            exit 1
+          fi
+          # The old name is installed as a symlink to the binary.
+          if [ "$("stage/staging/comsa-rs-${VERSION}/bin/comsa" --version)" != "comsa-rs ${VERSION}" ]; then
+            echo "comsa symlink is missing or broken" >&2
             exit 1
           fi
           # Round trip a small family, and check that invalid input is rejected.
@@ -122,6 +127,6 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           gh release create "${{ github.ref_name }}" \
-            --title "comsa ${{ github.ref_name }}" \
+            --title "comsa-rs ${{ github.ref_name }}" \
             --generate-notes \
             artifacts/*

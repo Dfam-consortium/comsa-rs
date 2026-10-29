@@ -6,7 +6,7 @@ which are git-ignored. The full run needs about 4 GB of disk.
 
 You need three binaries:
 
-* `RS`: this project (`target/release/comsa`)
+* `RS`: this project (`target/release/comsa-rs`)
 * `CF`: CoMSA 1.1 with `patches/comsa-1.1-fixes.patch` applied
 * `CO`: unmodified CoMSA 1.1
 

@@ -3,7 +3,7 @@
 
 # Release staging produced by `make dist`
 /stage/
-/comsa-*.tar.gz
+/comsa-rs-*.tar.gz
 
 # Archives and decompressed output from local experiments
 *.smsac
