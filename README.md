@@ -64,11 +64,13 @@ make test                    # optional
 make install PREFIX=/opt     # installs /opt/comsa-rs-<version>/bin/comsa-rs and docs
 ```
 
-The binary is `comsa-rs`; `make install` and the release archives also include a
-`comsa` symlink to it, so scripts written for the old name keep working.
+The binary is `comsa-rs`. `make install` and the release archives also put a `CoMSA`
+symlink to it at the top of the package directory (`comsa-rs-<version>/CoMSA`), where
+CoMSA 1.1 keeps its binary, so a setup that runs `<dir>/CoMSA` can point `<dir>` at
+the comsa-rs package unchanged.
 
 or simply `cargo install --git https://github.com/Dfam-consortium/comsa-rs` (this
-installs only `comsa-rs`, without the `comsa` symlink).
+installs only `comsa-rs`, without the `CoMSA` symlink).
 
 ### As a library
 

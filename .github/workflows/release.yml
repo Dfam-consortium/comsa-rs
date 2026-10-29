@@ -87,9 +87,9 @@ jobs:
             echo "comsa-rs reports '${OUT}', expected 'comsa-rs ${VERSION}'" >&2
             exit 1
           fi
-          # The old name is installed as a symlink to the binary.
-          if [ "$("stage/staging/comsa-rs-${VERSION}/bin/comsa" --version)" != "comsa-rs ${VERSION}" ]; then
-            echo "comsa symlink is missing or broken" >&2
+          # The CoMSA 1.1 name is installed as a symlink at the package top level.
+          if [ "$("stage/staging/comsa-rs-${VERSION}/CoMSA" --version)" != "comsa-rs ${VERSION}" ]; then
+            echo "CoMSA symlink is missing or broken" >&2
             exit 1
           fi
           # Round trip a small family, and check that invalid input is rejected.

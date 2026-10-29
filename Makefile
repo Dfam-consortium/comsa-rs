@@ -2,7 +2,7 @@
 #
 # Layout produced by `make install`:
 #   $(PREFIX)/$(NAME)-$(VERSION)/bin/comsa-rs     the compiled binary
-#   $(PREFIX)/$(NAME)-$(VERSION)/bin/comsa        symlink to it (the pre-rename name)
+#   $(PREFIX)/$(NAME)-$(VERSION)/CoMSA            symlink to bin/comsa-rs (drop-in for CoMSA 1.1)
 #   $(PREFIX)/$(NAME)-$(VERSION)/README.md        documentation (see DOCS)
 #   $(PREFIX)/$(NAME)-$(VERSION)/CHANGELOG.md
 #   $(PREFIX)/$(NAME)-$(VERSION)/LICENSE
@@ -20,8 +20,10 @@ NAME       ?= comsa-rs
 CARGO      ?= cargo
 INSTALL    ?= install
 BIN         = comsa-rs
-# Installed as a symlink to $(BIN) so scripts that call the old name keep working.
-ALIAS       = comsa
+# Installed as a symlink to bin/$(BIN) at the top of the package directory, so the
+# package can replace a CoMSA 1.1 directory: CoMSA 1.1 builds (and releases) a bare
+# CoMSA binary at its top level, with no bin/ subdirectory.
+ALIAS       = CoMSA
 MANIFEST    = Cargo.toml
 # Documentation shipped in a binary release. Listed by name rather than globbed as
 # *.md, so that a maintainer note at the top level does not end up in a release.
@@ -51,7 +53,7 @@ test:
 install: build
 	$(INSTALL) -d $(PKGDIR)/bin
 	$(INSTALL) -m 0755 target/release/$(BIN) $(PKGDIR)/bin/$(BIN)
-	ln -sf $(BIN) $(PKGDIR)/bin/$(ALIAS)
+	ln -sf bin/$(BIN) $(PKGDIR)/$(ALIAS)
 	@for d in $(DOCS); do \
 	  $(INSTALL) -m 0644 $$d $(PKGDIR)/ && echo "  doc       <- $$d"; \
 	done

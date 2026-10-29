@@ -1,6 +1,6 @@
 [package]
 name = "comsa-rs"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 rust-version = "1.85"
 description = "Compressor for multiple sequence alignments (Stockholm and aligned FASTA); Rust port of CoMSA 1.1"
