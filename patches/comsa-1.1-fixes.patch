@@ -1,0 +1,2961 @@
+Bug-fix and performance patch for CoMSA 1.1
+===========================================
+
+Applies to: CoMSA v1.1 (https://github.com/refresh-bio/CoMSA/releases/tag/v1.1,
+            source archive .../archive/refs/tags/v1.1.tar.gz). It does NOT apply to
+            the untagged 1.2 code on CoMSA's master branch.
+Apply with: cd CoMSA-1.1 && patch -p1 < comsa-1.1-fixes.patch && make
+License:    GPL-3, like CoMSA itself.
+
+The archive format is unchanged: for valid input the alignment stream is
+byte-identical to unpatched CoMSA 1.1, and archives decode with either build.
+The only exception is '~', which 1.1 could not handle and which patched archives
+encode with a new symbol rank.
+
+Fixes
+- Input validation: sequence symbols must be A-Z, a-z, '-', '.', '*' or '~'. In
+  1.1, '}' was silently corrupted, '~' produced archives that crashed the
+  decompressor, and digits, '?' and non-ASCII bytes aborted compression. '~' (Easel's
+  missing-data symbol) is now supported. Unequal sequence lengths and duplicate
+  sequence names (interleaved Stockholm, not supported) give a clear error instead
+  of exit(1) from a worker thread.
+- An input file whose size is a multiple of 128 MiB no longer loops until memory
+  runs out (CInFile::Get end-of-file handling).
+- Damaged or truncated archives fail cleanly instead of hanging or crashing: the
+  footer, block sizes, varints, LZMA result and range-decoder state are all
+  checked.
+- The exit status is non-zero on failure, and the partial output file is removed.
+- The @list file is read with getline (no fixed-size buffer; names may contain
+  spaces). Reading of #=GF ID/AC no longer reads past short lines. The no-op
+  assert() in the entropy decoder is now a real check. Write errors are reported.
+  Families whose sequences are all empty round-trip. FASTA files without a
+  trailing newline no longer lose their last byte. Fixed a decoder memory leak.
+- Size fields are written explicitly as little-endian (same bytes on x86/ARM).
+
+Performance
+- The WFC weight table is built once instead of once per family per thread (it
+  was ~60% of the CPU time on small families).
+- The LZMA dictionary is sized to the input instead of always 64 MiB.
+- Families are compressed and decompressed in parallel (new option -t <threads>).
+  Small families run their pipeline stages in the calling thread instead of
+  starting ~9 threads each.
+- Queue items are moved instead of copied; PBWT histograms are allocated once.
+- Typical effect: 3,000 small Pfam families compress 15.3 s -> 0.34 s and
+  decompress 7.8 s -> 0.25 s.
+
+diff -ruN -x '*.o' -x CoMSA -x libs -x lzma -x '*.vcxproj*' -x sample CoMSA-1.1/src/CoMSA.cpp CoMSA-1.1.fixed/src/CoMSA.cpp
+--- CoMSA-1.1/src/CoMSA.cpp	2018-04-12 01:17:30.000000000 -0700
++++ CoMSA-1.1.fixed/src/CoMSA.cpp	2026-10-29 13:41:00.777535326 -0700
+@@ -8,11 +8,19 @@
+ // *******************************************************************************************
+ 
+ #include <iostream>
++#include <fstream>
+ #include <string>
+ #include <vector>
+ #include <thread>
+ #include <chrono>
+ #include <cstring>
++#include <cstdio>
++#include <deque>
++#include <map>
++#include <mutex>
++#include <condition_variable>
++#include <functional>
++#include <memory>
+ 
+ #include "msa.h"
+ #include "fasta_file.h"
+@@ -22,7 +30,7 @@
+ 
+ #define NORM(x,mi,ma)	((x) < (mi) ? (mi) : (x) > (ma) ? (ma) : (x))
+ 
+-enum class task_mode_t {FASTA_compress, FASTA_decompress, 
++enum class task_mode_t {FASTA_compress, FASTA_decompress,
+ 	Stockholm_compress, Stockholm_decompress, Stockholm_extract, Stockholm_list};
+ 
+ task_mode_t mode;
+@@ -32,6 +40,10 @@
+ bool fast_variant = false;
+ string extract_ID;
+ string extract_AC;
++int n_threads = 0;
++
++// Limits of the data being processed at the same time in the family-parallel modes
++const size_t MAX_IN_FLIGHT_BYTES = 1ull << 30;
+ 
+ #ifdef EXPERIMENTAL_MODE
+ bool PBWT_copy_mode = false;
+@@ -39,8 +51,6 @@
+ bool RLE0_copy_mode = false;
+ #endif
+ 
+-CMSACompress *msac;
+-
+ CFastaFile fasta;
+ 
+ vector<string> v_sequences;
+@@ -57,6 +67,7 @@
+ 
+ bool parse_params(int argc, char **argv);
+ void usage();
++int default_n_threads();
+ 
+ // *******************************************************************************************
+ // Show usage info
+@@ -78,6 +89,7 @@
+ 	cout << "Options:\n";
+ 	cout << "   -w <width>   - wrap sequences in FASTA file to given length (only for Fd mode); default: 0 (no wrapping)\n";
+ 	cout << "   -f           - turn on fast variant (MTF in place of WFC)\n";
++	cout << "   -t <threads> - no. of families processed in parallel (only for Sc and Sd modes); default: " << default_n_threads() << "\n";
+ 	cout << "   -eID <id>    - extract family of given id (only for 'Se' mode)\n";
+ 	cout << "   -eAC <ac>    - extract family of given accession number (only for 'Se' mode)\n";
+ #ifdef EXPERIMENTAL_MODE
+@@ -85,13 +97,35 @@
+ 	cout << "   -Scm         - turn on MTF/WFC copy mode\n";
+ 	cout << "   -Rcm         - turn on RLE0 copy mode\n";
+ #endif
++	cout << "Sequences may contain only the symbols A-Z, a-z, '-', '.', '*' and '~'.\n";
+ 	cout << "Sample executions:\n";
+ 	cout << "   CoMSA Fc PF00005.fasta PF00005.msac\n";
+ 	cout << "   CoMSA Fd PF00005.msac PF00005.fasta\n";
+ 	cout << "   CoMSA Sc pfam.stockholm pfam.smsac\n";
+ 	cout << "   CoMSA Sc @files.txt pfam.smsac\n";
+ 	cout << "   CoMSA Sl pfam.smsac\n";
+-	cout << "   CoMSA Se -eAC PF00005.26 pfam.stockholm pfam.smsac\n";
++	cout << "   CoMSA Se -eAC PF00005.26 pfam.smsac PF00005.stockholm\n";
++}
++
++// *******************************************************************************************
++// Default no. of worker threads
++int default_n_threads()
++{
++	int n = (int) thread::hardware_concurrency();
++
++	return NORM(n, 1, 16);
++}
++
++// *******************************************************************************************
++// Remove whitespace from both ends of a string
++string trim_ws(const string &s)
++{
++	size_t b = s.find_first_not_of(" \t\r\n");
++	if (b == string::npos)
++		return string();
++	size_t e = s.find_last_not_of(" \t\r\n");
++
++	return s.substr(b, e - b + 1);
+ }
+ 
+ // *******************************************************************************************
+@@ -137,6 +171,11 @@
+ 			fast_variant = true;
+ 			arg_no++;
+ 		}
++		else if (strcmp(argv[arg_no], "-t") == 0 && arg_no + 2 < argc)
++		{
++			n_threads = NORM(atoi(argv[arg_no + 1]), 1, 1024);
++			arg_no += 2;
++		}
+ 		else if (strcmp(argv[arg_no], "-eID") == 0 && mode == task_mode_t::Stockholm_extract && arg_no + 2 < argc)
+ 		{
+ 			extract_ID = string(argv[arg_no + 1]);
+@@ -166,11 +205,14 @@
+ #endif
+ 		else
+ 		{
+-			cout << "Invalid option: " << string(argv[arg_no]) << endl;
++			cerr << "Invalid option: " << string(argv[arg_no]) << endl;
+ 			return false;
+ 		}
+ 	}
+ 
++	if (n_threads == 0)
++		n_threads = default_n_threads();
++
+ 	if (arg_no + 1 > argc)
+ 	{
+ 		usage();
+@@ -180,21 +222,29 @@
+ 
+ 	if (argv[arg_no][0] == '@' && mode == task_mode_t::Stockholm_compress)
+ 	{
+-		FILE *f = fopen(argv[arg_no]+1, "rb");
++		ifstream f(argv[arg_no] + 1);
+ 		if (!f)
++		{
++			cerr << "Cannot open " << argv[arg_no] + 1 << " file\n";
+ 			return false;
++		}
+ 
+-		char s[1024];
+-		while (!feof(f))
++		string s;
++		while (getline(f, s))
+ 		{
+-			if (fscanf(f, "%s", s) == 1)
+-			{
+-				v_in_names.push_back(string(s));
+-				cout << s << endl;
+-			}
++			s = trim_ws(s);
++			if (s.empty())
++				continue;
++
++			v_in_names.push_back(s);
++			cout << s << endl;
+ 		}
+ 
+-		fclose(f); 
++		if (v_in_names.empty())
++		{
++			cerr << "No file names in " << argv[arg_no] + 1 << endl;
++			return false;
++		}
+ 
+ 		++arg_no;
+ 	}
+@@ -215,6 +265,142 @@
+ }
+ 
+ // *******************************************************************************************
++// Create a compressor object; family_parallel - whether several families are processed at the same time
++unique_ptr<CMSACompress> make_msac(bool family_parallel)
++{
++	unique_ptr<CMSACompress> msac(new CMSACompress());
++
++	if (family_parallel)
++		msac->SetSequentialMaxCells(SEQUENTIAL_PIPELINE_MAX_CELLS_PARALLEL);
++
++#ifdef EXPERIMENTAL_MODE
++	msac->SetCopyModes(PBWT_copy_mode, SS_copy_mode, RLE0_copy_mode);
++#endif
++
++	return msac;
++}
++
++// *******************************************************************************************
++// Process items in parallel keeping their order:
++//    * read(item, cost) is called in the calling thread; returns 1 (item read), 0 (no more items) or -1 (error);
++//      cost is an estimate of memory needed for the item
++//    * process(msac, in, out) is called in n_workers threads, each having its own compressor object
++//    * write(out) is called (in a separate thread) in the order in which items were read
++// Returns false if any of the callbacks failed.
++template<typename T_IN, typename T_OUT> bool process_in_order(int n_workers,
++	function<int(T_IN &, size_t &)> read, function<bool(CMSACompress &, T_IN &, T_OUT &)> process, function<bool(T_OUT &)> write)
++{
++	mutex mtx;
++	condition_variable cv;
++
++	deque<pair<size_t, T_IN>> q_in;
++	map<size_t, T_OUT> m_out;
++	map<size_t, size_t> m_cost;
++	size_t n_read = 0;
++	size_t n_written = 0;
++	size_t in_flight_bytes = 0;
++	bool reading_done = false;
++	bool failed = false;
++	const size_t max_in_flight = 2 * n_workers + 2;
++
++	vector<thread> v_workers;
++	for (int i = 0; i < n_workers; ++i)
++		v_workers.emplace_back([&] {
++			auto msac = make_msac(n_workers > 1);
++
++			while (true)
++			{
++				unique_lock<mutex> lck(mtx);
++				cv.wait(lck, [&] { return !q_in.empty() || reading_done || failed; });
++
++				if (failed || q_in.empty())
++					return;
++
++				auto item = move(q_in.front());
++				q_in.pop_front();
++				lck.unlock();
++
++				T_OUT out;
++				bool ok = process(*msac, item.second, out);
++
++				lck.lock();
++				if (ok)
++					m_out.emplace(item.first, move(out));
++				else
++					failed = true;
++				cv.notify_all();
++			}
++		});
++
++	thread writer([&] {
++		while (true)
++		{
++			unique_lock<mutex> lck(mtx);
++			cv.wait(lck, [&] { return failed || m_out.count(n_written) || (reading_done && n_written == n_read); });
++
++			if (failed || !m_out.count(n_written))
++				return;
++
++			T_OUT out = move(m_out[n_written]);
++			m_out.erase(n_written);
++			lck.unlock();
++
++			bool ok = write(out);
++
++			lck.lock();
++			if (!ok)
++				failed = true;
++			in_flight_bytes -= m_cost[n_written];
++			m_cost.erase(n_written);
++			++n_written;
++			cv.notify_all();
++		}
++	});
++
++	// Reading in the calling thread
++	while (true)
++	{
++		{
++			unique_lock<mutex> lck(mtx);
++			cv.wait(lck, [&] { return failed ||
++				(n_read - n_written < max_in_flight && (in_flight_bytes < MAX_IN_FLIGHT_BYTES || n_read == n_written)); });
++			if (failed)
++				break;
++		}
++
++		T_IN item;
++		size_t cost = 0;
++		int r = read(item, cost);
++
++		lock_guard<mutex> lck(mtx);
++		if (r <= 0)
++		{
++			if (r < 0)
++				failed = true;
++			break;
++		}
++
++		q_in.emplace_back(n_read, move(item));
++		m_cost[n_read] = cost;
++		in_flight_bytes += cost;
++		++n_read;
++		cv.notify_all();
++	}
++
++	{
++		lock_guard<mutex> lck(mtx);
++		reading_done = true;
++		cv.notify_all();
++	}
++
++	for (auto &t : v_workers)
++		t.join();
++	writer.join();
++
++	return !failed;
++}
++
++// *******************************************************************************************
+ // FASTA compression
+ bool FASTA_compress()
+ {
+@@ -231,10 +417,19 @@
+ 	size_t comp_text_size;
+ 	size_t comp_seq_size;
+ 
+-	msac->Compress(v_names, v_sequences, v_compressed_data, comp_text_size, comp_seq_size, fast_variant);
++	auto msac = make_msac(false);
++
++	if (!msac->Compress(v_names, v_sequences, v_compressed_data, comp_text_size, comp_seq_size, fast_variant))
++	{
++		cerr << "Fatal error during compression\n";
++		return false;
++	}
+ 
+ 	if (!CCompressedFastaFile::Save(out_name, v_compressed_data))
++	{
++		remove(out_name.c_str());
+ 		return false;
++	}
+ 
+ 	auto end_time = std::chrono::high_resolution_clock::now();
+ 	std::chrono::duration<double> diff = end_time - start_time;
+@@ -243,7 +438,7 @@
+ 	cout << "Names compressed to    : " << comp_text_size << " bytes               \n";
+ 	cout << "Total size             : " << comp_text_size + comp_seq_size << " bytes               \n";
+ 	cout << "Compression time       : " << diff.count() << " s\n";
+-	
++
+ 	return true;
+ }
+ 
+@@ -256,13 +451,20 @@
+ 	if (!CCompressedFastaFile::Load(v_in_names.front(), v_compressed_data))
+ 		return false;
+ 
+-	msac->Decompress(v_compressed_data, v_names, v_sequences);
++	auto msac = make_msac(false);
++
++	if (!msac->Decompress(v_compressed_data, v_names, v_sequences))
++	{
++		cerr << v_in_names.front() << " is not a valid compressed FASTA file (truncated or corrupted)\n";
++		return false;
++	}
+ 
+ 	fasta.PutSequences(v_names, v_sequences, wrap_width);
+ 
+ 	if (!fasta.SaveFile(out_name))
+ 	{
+-		cerr << "Cannot sava data in " << out_name << " file\n";
++		cerr << "Cannot save data in " << out_name << " file\n";
++		remove(out_name.c_str());
+ 		return false;
+ 	}
+ 
+@@ -270,11 +472,31 @@
+ 	std::chrono::duration<double> diff = end_time - start_time;
+ 
+ 	cout << "Decompression time : " << diff.count() << " s\n";
+-	
++
+ 	return true;
+ }
+ 
+ // *******************************************************************************************
++// Single Stockholm family
++struct stockholm_family_t {
++	vector<vector<uint8_t>> v_meta;
++	vector<uint32_t> v_offsets;
++	vector<string> v_names;
++	vector<string> v_sequences;
++	string ID, AC;
++	size_t raw_size = 0;
++};
++
++// *******************************************************************************************
++// Compressed Stockholm family
++struct compressed_family_t {
++	vector<uint8_t> v_compressed_data;
++	stockholm_family_desc_t desc;
++	size_t comp_text_size = 0;
++	size_t comp_seq_size = 0;
++};
++
++// *******************************************************************************************
+ // Stockholm compression
+ bool Stockholm_compress()
+ {
+@@ -290,84 +512,117 @@
+ 
+ 	size_t total_comp_text_size = 0;
+ 	size_t total_comp_seq_size = 0;
++	size_t total_raw_size = 0;
+ 	uint32_t dataset_no = 0;
+ 
+-	for (auto &sto_name : v_in_names)
+-	{
+-		if (!sf.OpenForReading(sto_name))
+-		{
+-			cout << "Cannot open: " << sto_name << endl;
+-			return false;
+-		}
++	size_t file_no = 0;
++	bool file_open = false;
+ 
+-		while (!sf.Eof())
++	auto read = [&](stockholm_family_t &fam, size_t &cost) -> int {
++		while (true)
+ 		{
+-			vector<vector<uint8_t>> v_meta;
+-			vector<uint32_t> v_offsets;
+-			vector<string> v_names;
+-			vector<string> v_sequences;
+-			vector<uint8_t> v_compressed_data;
+-
+-			size_t comp_text_size;
+-			size_t comp_seq_size;
+-			string ID, AC;
++			if (!file_open)
++			{
++				if (file_no == v_in_names.size())
++					return 0;
+ 
+-			size_t f_pos1 = sf.GetPos();
++				if (!sf.OpenForReading(v_in_names[file_no++]))
++					return -1;
++				file_open = true;
++			}
+ 
+-			if (!sf.GetSequences(v_meta, v_offsets, v_names, v_sequences, ID, AC))
++			if (sf.Eof())
++			{
++				sf.Close();
++				file_open = false;
+ 				continue;
++			}
+ 
+-			size_t f_pos2 = sf.GetPos();
++			size_t f_pos1 = sf.GetPos();
+ 
+-			if (!msac->Compress(v_meta, v_offsets, v_names, v_sequences, v_compressed_data, comp_text_size, comp_seq_size, fast_variant))
++			if (sf.GetSequences(fam.v_meta, fam.v_offsets, fam.v_names, fam.v_sequences, fam.ID, fam.AC))
+ 			{
+-				cerr << "Fatal error during compression\n";
+-				return false;
++				fam.raw_size = sf.GetPos() - f_pos1;
++				cost = fam.raw_size;
++				return 1;
+ 			}
+ 
+-			v_fam_desc.push_back(stockholm_family_desc_t(
+-				v_sequences.size(),
+-				v_sequences.empty() ? 0 : v_sequences.front().size(),
+-				f_pos2 - f_pos1,
+-				comp_text_size + comp_seq_size,
+-				csf.GetPos(),
+-				ID,
+-				AC
+-			));
++			if (sf.Failed())
++				return -1;
++		}
++	};
+ 
+-			if (!csf.Store(v_compressed_data))
+-			{
+-				cerr << "Fatal error during saving compressed data\n";
+-				return false;
+-			}
++	auto process = [](CMSACompress &msac, stockholm_family_t &fam, compressed_family_t &cf) -> bool {
++		if (!msac.Compress(fam.v_meta, fam.v_offsets, fam.v_names, fam.v_sequences, cf.v_compressed_data, cf.comp_text_size, cf.comp_seq_size, fast_variant))
++		{
++			cerr << "Fatal error during compression of family " << fam.ID << endl;
++			return false;
++		}
+ 
+-			total_comp_text_size += comp_text_size;
+-			total_comp_seq_size += comp_seq_size;
++		cf.desc = stockholm_family_desc_t(
++			fam.v_sequences.size(),
++			fam.v_sequences.empty() ? 0 : fam.v_sequences.front().size(),
++			fam.raw_size,
++			cf.comp_text_size + cf.comp_seq_size,
++			0,
++			fam.ID,
++			fam.AC);
++
++		return true;
++	};
++
++	auto write = [&](compressed_family_t &cf) -> bool {
++		cf.desc.compressed_data_ptr = csf.GetPos();
++		v_fam_desc.push_back(cf.desc);
+ 
+-			if (total_comp_text_size + total_comp_seq_size < 20000)
+-				cout << "Dataset no. " << dataset_no++
+-				<< "   (" << sf.GetPos() << " -> " << total_comp_text_size + total_comp_seq_size << ")  compression ratio: "
+-				<< (double)sf.GetPos() / (total_comp_text_size + total_comp_seq_size) << "        \r";
+-			else if (total_comp_text_size + total_comp_seq_size < 20000000)
+-				cout << "Dataset no. " << dataset_no++
+-				<< "   (" << sf.GetPos() / 1000 << "K -> " << (total_comp_text_size + total_comp_seq_size) / 1000 << "K)  compression ratio: "
+-				<< (double)sf.GetPos() / (total_comp_text_size + total_comp_seq_size) << "            \r";
+-			else
+-				cout << "Dataset no. " << dataset_no++
+-				<< "   (" << sf.GetPos() / 1000000 << "M -> " << (total_comp_text_size + total_comp_seq_size) / 1000000 << "M)  compression ratio: "
+-				<< (double)sf.GetPos() / (total_comp_text_size + total_comp_seq_size) << "        \r";
++		if (!csf.Store(cf.v_compressed_data))
++		{
++			cerr << "Fatal error during saving compressed data\n";
++			return false;
+ 		}
+ 
++		total_comp_text_size += cf.comp_text_size;
++		total_comp_seq_size += cf.comp_seq_size;
++		total_raw_size += cf.desc.raw_size;
++
++		size_t total_comp = total_comp_text_size + total_comp_seq_size;
++
++		if (total_comp < 20000)
++			cout << "Dataset no. " << dataset_no++
++			<< "   (" << total_raw_size << " -> " << total_comp << ")  compression ratio: "
++			<< (double)total_raw_size / total_comp << "        \r";
++		else if (total_comp < 20000000)
++			cout << "Dataset no. " << dataset_no++
++			<< "   (" << total_raw_size / 1000 << "K -> " << total_comp / 1000 << "K)  compression ratio: "
++			<< (double)total_raw_size / total_comp << "            \r";
++		else
++			cout << "Dataset no. " << dataset_no++
++			<< "   (" << total_raw_size / 1000000 << "M -> " << total_comp / 1000000 << "M)  compression ratio: "
++			<< (double)total_raw_size / total_comp << "        \r";
++
++		return true;
++	};
++
++	bool ok = process_in_order<stockholm_family_t, compressed_family_t>(n_threads, read, process, write);
++
++	if (file_open)
+ 		sf.Close();
+-	}
+ 
+ 	// Store family descriptions
+-	csf.StoreFamilyDescriptions(v_fam_desc);
++	if (ok)
++		ok = csf.StoreFamilyDescriptions(v_fam_desc);
+ 
+-	csf.Close();
++	ok &= csf.Close();
+ 
+ 	cout << endl;
+ 
++	if (!ok)
++	{
++		cerr << "Compression failed; " << out_name << " was not created\n";
++		remove(out_name.c_str());
++		return false;
++	}
++
+ 	auto end_time = std::chrono::high_resolution_clock::now();
+ 	std::chrono::duration<double> diff = end_time - start_time;
+ 
+@@ -390,42 +645,64 @@
+ 	if (!csf.OpenForReading(v_in_names.front()))
+ 		return false;
+ 
++	vector<stockholm_family_desc_t> v_fam_desc;
++	csf.LoadFamilyDescriptions(v_fam_desc);
++
+ 	if (!sf.OpenForWriting(out_name))
+ 		return false;
+ 
+ 	uint32_t dataset_no = 0;
++	size_t block_no = 0;
+ 
+-	while (!csf.Eof())
+-	{
+-		vector<vector<uint8_t>> v_meta;
+-		vector<uint32_t> v_offsets;
+-		vector<string> v_names;
+-		vector<string> v_sequences;
+-		vector<uint8_t> v_compressed_data;
++	auto read = [&](vector<uint8_t> &v_compressed_data, size_t &cost) -> int {
++		if (csf.Eof())
++			return 0;
+ 
+ 		if (!csf.Load(v_compressed_data))
+-			break;
+-
+-		if (!msac->Decompress(v_compressed_data, v_meta, v_offsets, v_names, v_sequences))
+ 		{
+-			cerr << "Fatal error during decompression\n";
+-			return false;
++			cerr << v_in_names.front() << " is not a valid compressed Stockholm file (truncated or corrupted)\n";
++			return -1;
+ 		}
+ 
+-		if (!sf.PutSequences(v_meta, v_offsets, v_names, v_sequences))
++		// Memory needed for the decompressed family is known from the footer
++		cost = v_compressed_data.size();
++		if (block_no < v_fam_desc.size())
++			cost = max(cost, v_fam_desc[block_no].raw_size);
++		++block_no;
++
++		return 1;
++	};
++
++	auto process = [](CMSACompress &msac, vector<uint8_t> &v_compressed_data, stockholm_family_t &fam) -> bool {
++		if (!msac.Decompress(v_compressed_data, fam.v_meta, fam.v_offsets, fam.v_names, fam.v_sequences))
+ 		{
+-			cerr << "Fatal error during saving compressed data\n";
++			cerr << "Fatal error during decompression (corrupted data)\n";
+ 			return false;
+ 		}
+ 
++		return true;
++	};
++
++	auto write = [&](stockholm_family_t &fam) -> bool {
++		sf.PutSequences(fam.v_meta, fam.v_offsets, fam.v_names, fam.v_sequences);
+ 		cout << "Dataset no. " << dataset_no++ << "\r";
+-	}
++
++		return true;
++	};
++
++	bool ok = process_in_order<vector<uint8_t>, stockholm_family_t>(n_threads, read, process, write);
+ 
+ 	cout << endl;
+ 
+-	sf.Close();
++	ok &= sf.Close();
+ 	csf.Close();
+ 
++	if (!ok)
++	{
++		remove(out_name.c_str());
++		return false;
++	}
++
+ 	cout << endl;
+ 
+ 	auto end_time = std::chrono::high_resolution_clock::now();
+@@ -444,7 +721,8 @@
+ 	CStockholmFile sf;
+ 	CCompressedStockholmFile csf;
+ 
+-	if (!csf.OpenForReading(v_in_names.front()))
++	// Only selected blocks are read, so a large stdio buffer would only waste reads
++	if (!csf.OpenForReading(v_in_names.front(), 1 << 20))
+ 		return false;
+ 
+ 	vector<stockholm_family_desc_t> v_fam_desc;
+@@ -455,6 +733,8 @@
+ 		return false;
+ 
+ 	uint32_t dataset_no = 0;
++	bool ok = true;
++	auto msac = make_msac(false);
+ 
+ 	for(auto &fd : v_fam_desc)
+ 	{
+@@ -463,37 +743,42 @@
+ 		if (!extract_AC.empty() && fd.AC != extract_AC)
+ 			continue;
+ 
+-		csf.SetPos(fd.compressed_data_ptr);
+-
+ 		vector<vector<uint8_t>> v_meta;
+ 		vector<uint32_t> v_offsets;
+ 		vector<string> v_names;
+ 		vector<string> v_sequences;
+ 		vector<uint8_t> v_compressed_data;
+ 
+-		if (!csf.Load(v_compressed_data))
+-			break;
+-
+-		if (!msac->Decompress(v_compressed_data, v_meta, v_offsets, v_names, v_sequences))
++		if (!csf.SetPos(fd.compressed_data_ptr) || !csf.Load(v_compressed_data) ||
++			!msac->Decompress(v_compressed_data, v_meta, v_offsets, v_names, v_sequences))
+ 		{
+-			cerr << "Fatal error during decompression\n";
+-			return false;
++			cerr << "Fatal error during decompression (corrupted data)\n";
++			ok = false;
++			break;
+ 		}
+ 
+-		if (!sf.PutSequences(v_meta, v_offsets, v_names, v_sequences))
+-		{
+-			cerr << "Fatal error during saving compressed data\n";
+-			return false;
+-		}
++		sf.PutSequences(v_meta, v_offsets, v_names, v_sequences);
+ 
+ 		cout << "Dataset no. " << dataset_no++ << "\r";
+ 	}
+ 
+ 	cout << endl;
+ 
+-	sf.Close();
++	ok &= sf.Close();
+ 	csf.Close();
+ 
++	if (ok && dataset_no == 0)
++	{
++		cerr << "No family matching the given ID/AC was found\n";
++		ok = false;
++	}
++
++	if (!ok)
++	{
++		remove(out_name.c_str());
++		return false;
++	}
++
+ 	cout << endl;
+ 
+ 	auto end_time = std::chrono::high_resolution_clock::now();
+@@ -511,7 +796,7 @@
+ 
+ 	CCompressedStockholmFile csf;
+ 
+-	if (!csf.OpenForReading(v_in_names.front()))
++	if (!csf.OpenForReading(v_in_names.front(), 1 << 20))
+ 		return false;
+ 
+ 	vector<stockholm_family_desc_t> v_fam_desc;
+@@ -530,7 +815,7 @@
+ 	auto end_time = std::chrono::high_resolution_clock::now();
+ 	std::chrono::duration<double> diff = end_time - start_time;
+ 
+-	cout << "Decompression time : " << diff.count() << " s\n";
++	cout << "Listing time : " << diff.count() << " s\n";
+ 
+ 	return true;
+ }
+@@ -540,30 +825,32 @@
+ int main(int argc, char **argv)
+ {
+ 	if (!parse_params(argc, argv))
+-		return 0;
+-
+-	msac = new CMSACompress();
+-
+-#ifdef EXPERIMENTAL_MODE
+-	msac->SetCopyModes(PBWT_copy_mode, SS_copy_mode, RLE0_copy_mode);
+-#endif
++		return 1;
+ 
+-	if (mode == task_mode_t::FASTA_compress)
+-		FASTA_compress();
+-	else if (mode == task_mode_t::FASTA_decompress)
+-		FASTA_decompress();
+-	else if (mode == task_mode_t::Stockholm_compress)
+-		Stockholm_compress();
+-	else if (mode == task_mode_t::Stockholm_decompress)
+-		Stockholm_decompress();
+-	else if (mode == task_mode_t::Stockholm_extract)
+-		Stockholm_extract();
+-	else if (mode == task_mode_t::Stockholm_list)
+-		Stockholm_list();
++	bool ok = false;
+ 
+-	delete msac;
++	try
++	{
++		if (mode == task_mode_t::FASTA_compress)
++			ok = FASTA_compress();
++		else if (mode == task_mode_t::FASTA_decompress)
++			ok = FASTA_decompress();
++		else if (mode == task_mode_t::Stockholm_compress)
++			ok = Stockholm_compress();
++		else if (mode == task_mode_t::Stockholm_decompress)
++			ok = Stockholm_decompress();
++		else if (mode == task_mode_t::Stockholm_extract)
++			ok = Stockholm_extract();
++		else if (mode == task_mode_t::Stockholm_list)
++			ok = Stockholm_list();
++	}
++	catch (std::bad_alloc &)
++	{
++		cerr << "Out of memory\n";
++		ok = false;
++	}
+ 
+-	return 0;
++	return ok ? 0 : 1;
+ }
+ 
+ // EOF
+diff -ruN -x '*.o' -x CoMSA -x libs -x lzma -x '*.vcxproj*' -x sample CoMSA-1.1/src/defs.h CoMSA-1.1.fixed/src/defs.h
+--- CoMSA-1.1/src/defs.h	2018-04-12 01:17:30.000000000 -0700
++++ CoMSA-1.1.fixed/src/defs.h	2026-10-29 13:31:08.221721286 -0700
+@@ -11,6 +11,7 @@
+ #include <vector>
+ #include <cstdint>
+ #include <cstring>
++#include <cstdio>
+ #include <string>
+ #include <vector>
+ 
+@@ -32,6 +33,63 @@
+ enum class stage_mode_t {forward, reverse, copy_forward, copy_reverse};
+ 
+ // *******************************************************************************************
++// Symbols allowed in aligned sequences: gaps ('-', '.'), letters, stop ('*'), missing data ('~').
++// Other symbols would get second-stage ranks that collide with RLE-0 codes (125, 126)
++// or exceed the range of the entropy coder's selector model, so they are rejected on input.
++inline bool is_valid_seq_symbol(uint8_t c)
++{
++	return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c == '-' || c == '.' || c == '*' || c == '~';
++}
++
++// *******************************************************************************************
++// Printable description of a symbol for error messages
++inline string describe_symbol(uint8_t c)
++{
++	char buf[16];
++	if (c >= 33 && c < 127)
++		snprintf(buf, sizeof(buf), "'%c'", c);
++	else
++		snprintf(buf, sizeof(buf), "0x%02X", c);
++	return string(buf);
++}
++
++// *******************************************************************************************
++// Check that all sequences consist of valid symbols and are of the same length.
++// On failure, returns false and describes the problem in err.
++inline bool validate_sequences(const vector<string> &v_names, const vector<string> &v_sequences, string &err)
++{
++	if (v_sequences.empty())
++		return true;
++
++	size_t len = v_sequences.front().size();
++
++	for (size_t i = 0; i < v_sequences.size(); ++i)
++	{
++		auto &seq = v_sequences[i];
++		string name = i < v_names.size() ? v_names[i] : string();
++		while (!name.empty() && (name.back() == ' ' || name.back() == '\t'))
++			name.pop_back();
++
++		for (size_t j = 0; j < seq.size(); ++j)
++			if (!is_valid_seq_symbol((uint8_t)seq[j]))
++			{
++				err = "invalid symbol " + describe_symbol((uint8_t)seq[j]) + " in sequence " + name + " at column " + to_string(j + 1) +
++					" (allowed: A-Z, a-z, '-', '.', '*', '~')";
++				return false;
++			}
++
++		if (seq.size() != len)
++		{
++			err = "sequence " + name + " has length " + to_string(seq.size()) + " but the first sequence has length " + to_string(len) +
++				" (interleaved/multi-block Stockholm is not supported)";
++			return false;
++		}
++	}
++
++	return true;
++}
++
++// *******************************************************************************************
+ struct stockholm_family_desc_t {
+ 	size_t n_sequences;
+ 	size_t n_columns;
+@@ -77,8 +135,20 @@
+ 		return read_pos >= v.size();
+ 	}
+ 
++	// True if more bytes were requested than available (corrupted data)
++	bool Overrun()
++	{
++		return read_pos > v.size();
++	}
++
+ 	uint8_t GetByte()
+ 	{
++		// Reading past the end happens only for corrupted data; return zeros instead of reading out of bounds
++		if (read_pos >= v.size())
++		{
++			++read_pos;
++			return 0;
++		}
+ 		return v[read_pos++];
+ 	}
+ 
+@@ -92,7 +162,7 @@
+ // Buffered input file
+ class CInFile
+ {
+-	const int BUFFER_SIZE = 128 << 20;
++	const size_t BUFFER_SIZE = 128 << 20;
+ 
+ 	FILE *f;
+ 	char *buffer;
+@@ -154,19 +224,20 @@
+ 	int Get()
+ 	{
+ 		if (buffer_pos < buffer_filled)
+-			return buffer[buffer_pos++];
++			return (unsigned char) buffer[buffer_pos++];
++
++		before_buffer_bytes += buffer_pos;
++		buffer_pos = 0;
++		buffer_filled = 0;
+ 
+ 		if (feof(f))
+ 			return EOF;
+ 
+-		before_buffer_bytes += buffer_pos;
+-
+ 		buffer_filled = fread(buffer, 1, BUFFER_SIZE, f);
+ 		if (buffer_filled == 0)
+-			return EOF;
++			return EOF;		// Eof() is true now (the file size was a multiple of BUFFER_SIZE)
+ 
+-		buffer_pos = 0;
+-		return buffer[buffer_pos++];
++		return (unsigned char) buffer[buffer_pos++];
+ 	}
+ 
+ 	bool Eof()
+@@ -229,12 +300,13 @@
+ 
+ 	bool Close()
+ 	{
+-		if (buffer_pos)
++		if (f && buffer_pos)
+ 			success &= fwrite(buffer, 1, buffer_pos, f) == buffer_pos;
++		buffer_pos = 0;
+ 
+ 		if (f)
+ 		{
+-			fclose(f);
++			success &= fclose(f) == 0;
+ 			f = nullptr;
+ 		}
+ 		if (buffer)
+diff -ruN -x '*.o' -x CoMSA -x libs -x lzma -x '*.vcxproj*' -x sample CoMSA-1.1/src/entropy.cpp CoMSA-1.1.fixed/src/entropy.cpp
+--- CoMSA-1.1/src/entropy.cpp	2018-04-12 01:17:30.000000000 -0700
++++ CoMSA-1.1.fixed/src/entropy.cpp	2026-10-29 13:32:01.675351397 -0700
+@@ -95,15 +95,23 @@
+ 
+ 			++n_vec;
+ 
+-			in_out->Push(priority++, dest);
++			in_out->Push(priority++, std::move(dest));
+ 			dest.clear();
+ 
+ 			cur_column_decoded_symbols = 0;
+ 		}
+ 		else if (cur_column_decoded_symbols > n_sequences)
+-			assert("Decoded too many\n");
++		{
++			failed = true;		// Decoded too many symbols in a column - corrupted data
++			break;
++		}
+ 
+ 		int prefix = rc_prefix[ctx_prefix]->Decode();
++		if (prefix < 0)
++		{
++			failed = true;
++			break;
++		}
+ 
+ 		ctx_prefix = ctx_update_prefix(ctx_prefix, prefix);
+ 		int x;
+@@ -135,7 +143,12 @@
+ 					zero_run_code = 0;
+ 
+ 				++zero_run_code_no_bits;
+-				zero_run_code += prefix << (zero_run_code_no_bits - 1);
++				if (zero_run_code_no_bits > 40)
++				{
++					failed = true;		// Impossibly long 0-run - corrupted data
++					break;
++				}
++				zero_run_code += (size_t) prefix << (zero_run_code_no_bits - 1);
+ 				
+ 				size_t zero_run_len = zero_run_code + (1ull << zero_run_code_no_bits) - 1;
+ 
+@@ -150,9 +163,19 @@
+ 		else
+ 		{
+ 			int selector = rc_selector[ctx_sel]->Decode() + 2;
++			if (selector < 2)
++			{
++				failed = true;
++				break;
++			}
+ 			ctx_sel = ctx_update_selector(ctx_sel, selector - 2);
+ 
+ 			int suffix = rc_suffix[ctx_sel % no_suffix_ctx]->Decode();
++			if (suffix < 0)
++			{
++				failed = true;
++				break;
++			}
+ 
+ 			x = suffix + (1 << (selector - 1));
+ 			
+@@ -163,7 +186,17 @@
+ 		++decoded_symbols;
+ 	}
+ 
+-	in_out->Push(priority, dest);
++	// Flush a pending 0-run at the end of the last column
++	if (!failed && zero_run_code_no_bits)
++		cur_column_decoded_symbols += zero_run_code + (1ull << zero_run_code_no_bits) - 1;
++
++	if (!failed && cur_column_decoded_symbols == n_sequences)
++		in_out->Push(priority, std::move(dest));
++	else if (!failed && !(cur_column_decoded_symbols == 0 && dest.empty()))
++		failed = true;
++
++	if (vios->Overrun())
++		failed = true;
+ 
+ 	rcd->End();
+ 
+diff -ruN -x '*.o' -x CoMSA -x libs -x lzma -x '*.vcxproj*' -x sample CoMSA-1.1/src/entropy.h CoMSA-1.1.fixed/src/entropy.h
+--- CoMSA-1.1/src/entropy.h	2018-04-12 01:17:30.000000000 -0700
++++ CoMSA-1.1.fixed/src/entropy.h	2026-10-29 13:30:55.431049080 -0700
+@@ -9,6 +9,7 @@
+ // *******************************************************************************************
+ 
+ #include <vector>
++#include <algorithm>
+ #include "defs.h"
+ #include "queue.h"
+ #include "rc.h"
+@@ -60,6 +61,8 @@
+ 	int no_selector_ctx;
+ 	int no_suffix_ctx;
+ 
++	bool failed;
++
+ 	void forward();
+ 	void reverse();
+ 
+@@ -74,8 +77,12 @@
+ 
+ public:
+ 	CEntropy(CRegisteringPriorityQueue<string> *_in_out, CVectorIOStream *_vios, size_t &pre_entropy_sequences_size, size_t _n_sequences, bool _forward_mode, ctx_length_t _ctx_length) :
+-		in_out(_in_out), vios(_vios), forward_mode(_forward_mode), pre_entropy_sequences_size(&pre_entropy_sequences_size), n_sequences(_n_sequences), ctx_length(_ctx_length), rce(nullptr), rcd(nullptr)
++		in_out(_in_out), vios(_vios), forward_mode(_forward_mode), pre_entropy_sequences_size(&pre_entropy_sequences_size), n_sequences(_n_sequences), ctx_length(_ctx_length), rce(nullptr), rcd(nullptr), failed(false)
+ 	{
++		fill_n(rc_prefix, MAX_NO_PREFIX_CTX, nullptr);
++		fill_n(rc_selector, MAX_NO_SELECTOR_CTX, nullptr);
++		fill_n(rc_suffix, MAX_NO_SUFFIX_CTX, nullptr);
++
+ 		if (!in_out || !vios)
+ 			throw "No I/O queues";
+ 
+@@ -90,6 +97,11 @@
+ 	}
+ 
+ 	void operator()();
++
++	bool Failed() const
++	{
++		return failed;
++	}
+ };
+ 
+ // EOF
+diff -ruN -x '*.o' -x CoMSA -x libs -x lzma -x '*.vcxproj*' -x sample CoMSA-1.1/src/fasta_file.cpp CoMSA-1.1.fixed/src/fasta_file.cpp
+--- CoMSA-1.1/src/fasta_file.cpp	2018-04-12 01:17:30.000000000 -0700
++++ CoMSA-1.1.fixed/src/fasta_file.cpp	2026-10-29 13:36:06.948065597 -0700
+@@ -29,7 +29,11 @@
+ 	in = new CInFile;
+ 
+ 	if (!in->Open(file_name))
++	{
++		delete in;
++		in = nullptr;
+ 		return false;
++	}
+ 
+ 	string name;
+ 	string sequence;
+@@ -41,7 +45,12 @@
+ 		test_symbol = in->Get();
+ 
+ 	if (test_symbol != '>')
++	{
++		cerr << "Error: " << file_name << " is not a FASTA file\n";
++		delete in;
++		in = nullptr;
+ 		return false;
++	}
+ 
+ 	while (!in->Eof())
+ 	{
+@@ -49,9 +58,8 @@
+ 		if (!read_name(name))
+ 			break;
+ 
+-		// Read sequence
+-		if (!read_sequence(sequence))
+-			break;
++		// Read sequence (can be empty)
++		read_sequence(sequence);
+ 
+ 		v_names.emplace_back(name);
+ 		v_sequences.emplace_back(sequence);
+@@ -60,6 +68,13 @@
+ 	delete in;
+ 	in = nullptr;
+ 
++	string err;
++	if (!validate_sequences(v_names, v_sequences, err))
++	{
++		cerr << "Error in " << file_name << ": " << err << endl;
++		return false;
++	}
++
+ 	return true;
+ }
+ 
+@@ -69,14 +84,14 @@
+ {
+ 	out = new COutFile();
+ 	if (!out->Open(file_name))
++	{
++		delete out;
++		out = nullptr;
+ 		return false;
++	}
+ 
+-	size_t n_seq = std::max(v_names.size(), v_sequences.size());
+-
+-	if (!n_seq)
+-		return true;
+-
+-	size_t seq_size = v_sequences.front().size();
++	size_t n_seq = std::min(v_names.size(), v_sequences.size());
++	size_t seq_size = n_seq ? v_sequences.front().size() : 0;
+ 
+ 	for (size_t i = 0; i < n_seq; ++i)
+ 	{
+@@ -106,11 +121,11 @@
+ 		}
+ 	}
+ 
+-	out->Close();
++	bool success = out->Close();
+ 	delete out;
+ 	out = nullptr;
+ 
+-	return true;
++	return success;
+ }
+ 
+ // *******************************************************************************************
+@@ -148,7 +163,7 @@
+ 	while (!in->Eof())
+ 	{
+ 		int c = in->Get();
+-		if (in->Eof())
++		if (c == EOF)
+ 			break;
+ 
+ 		if (c != '\n' && c != '\r')
+@@ -181,7 +196,7 @@
+ 	while (!in->Eof())
+ 	{
+ 		int c = in->Get();
+-		if (in->Eof())
++		if (c == EOF)
+ 			break;
+ 		if (c == '>')
+ 		{
+@@ -219,10 +234,13 @@
+ 		return false;
+ 	}
+ 
+-	fwrite(v_compressed_data.data(), 1, v_compressed_data.size(), out);
+-	fclose(out);
++	bool success = fwrite(v_compressed_data.data(), 1, v_compressed_data.size(), out) == v_compressed_data.size();
++	success &= fclose(out) == 0;
+ 
+-	return true;
++	if (!success)
++		cerr << "Error while writing " << file_name << " file\n";
++
++	return success;
+ }
+ 
+ // *******************************************************************************************
+@@ -241,10 +259,13 @@
+ 	my_fseek(in, 0, SEEK_SET);
+ 
+ 	v_compressed_data.resize(in_size);
+-	fread(v_compressed_data.data(), 1, in_size, in);
++	bool success = fread(v_compressed_data.data(), 1, in_size, in) == in_size;
+ 	fclose(in);
+ 
+-	return true;
++	if (!success)
++		cerr << "Error while reading " << file_name << " file\n";
++
++	return success;
+ }
+ 
+ // EOF
+diff -ruN -x '*.o' -x CoMSA -x libs -x lzma -x '*.vcxproj*' -x sample CoMSA-1.1/src/lzma_wrapper.cpp CoMSA-1.1.fixed/src/lzma_wrapper.cpp
+--- CoMSA-1.1/src/lzma_wrapper.cpp	2018-04-12 01:17:30.000000000 -0700
++++ CoMSA-1.1.fixed/src/lzma_wrapper.cpp	2026-10-29 13:31:18.775450819 -0700
+@@ -28,11 +28,14 @@
+ void CLZMAWrapper::forward()
+ {
+ 	if (v_text->empty())
++	{
++		success = true;
+ 		return;
++	}
+ 
+ 	lzma_stream strm = LZMA_STREAM_INIT;
+ 
+-	bool success = init_encoder(&strm, compression_mode);
++	success = init_encoder(&strm, compression_mode);
+ 	if (success)
+ 		success = compress(&strm, *v_text, *v_text_compressed);
+ 
+@@ -43,9 +46,13 @@
+ // Run LZMA decompression
+ void CLZMAWrapper::reverse()
+ {
+-	lzma_stream strm = LZMA_STREAM_INIT;
++	if (v_text_compressed->empty())
++	{
++		success = true;			// Nothing was compressed
++		return;
++	}
+ 
+-	bool success;
++	lzma_stream strm = LZMA_STREAM_INIT;
+ 
+ 	success = init_decoder(&strm);
+ 	if(success)
+@@ -58,7 +65,24 @@
+ // Initialize LZMA coder
+ bool CLZMAWrapper::init_encoder(lzma_stream *strm, uint32_t preset)
+ {
+-	lzma_ret ret = lzma_easy_encoder(strm, preset, LZMA_CHECK_CRC64);
++	lzma_options_lzma opt_lzma;
++
++	if (lzma_lzma_preset(&opt_lzma, preset))
++	{
++		cerr << "Unsupported LZMA preset\n";
++		return false;
++	}
++
++	// A dictionary larger than the input does not improve compression, but allocating and
++	// initializing it (64 MiB for preset 9) dominates the time for small inputs
++	uint32_t dict_size = 4096;
++	while (dict_size < v_text->size() && dict_size < opt_lzma.dict_size)
++		dict_size <<= 1;
++	opt_lzma.dict_size = dict_size;
++
++	lzma_filter filters[] = { { LZMA_FILTER_LZMA2, &opt_lzma }, { LZMA_VLI_UNKNOWN, NULL } };
++
++	lzma_ret ret = lzma_stream_encoder(strm, filters, LZMA_CHECK_CRC64);
+ 
+ 	if (ret == LZMA_OK)
+ 		return true;
+diff -ruN -x '*.o' -x CoMSA -x libs -x lzma -x '*.vcxproj*' -x sample CoMSA-1.1/src/lzma_wrapper.h CoMSA-1.1.fixed/src/lzma_wrapper.h
+--- CoMSA-1.1/src/lzma_wrapper.h	2018-04-12 01:17:30.000000000 -0700
++++ CoMSA-1.1.fixed/src/lzma_wrapper.h	2026-10-29 13:31:18.774450845 -0700
+@@ -27,6 +27,7 @@
+ 
+ 	bool forward_mode;
+ 	int compression_mode;
++	bool success;
+ 
+ 	void forward();
+ 	void reverse();
+@@ -39,11 +40,16 @@
+ 
+ public:
+ 	CLZMAWrapper(vector<uint8_t> *_v_text, vector<uint8_t> *_v_text_compressed, bool _forward_mode, int _compression_mode = 0) : 
+-		v_text(_v_text), v_text_compressed(_v_text_compressed), forward_mode(_forward_mode), compression_mode(_compression_mode)
++		v_text(_v_text), v_text_compressed(_v_text_compressed), forward_mode(_forward_mode), compression_mode(_compression_mode), success(false)
+ 	{
+ 	};
+ 
+ 	void operator()();
++
++	bool Success() const
++	{
++		return success;
++	}
+ };
+ 
+ // EOF
+diff -ruN -x '*.o' -x CoMSA -x libs -x lzma -x '*.vcxproj*' -x sample CoMSA-1.1/src/msa.cpp CoMSA-1.1.fixed/src/msa.cpp
+--- CoMSA-1.1/src/msa.cpp	2018-04-12 01:17:30.000000000 -0700
++++ CoMSA-1.1.fixed/src/msa.cpp	2026-10-29 13:41:00.768535556 -0700
+@@ -9,6 +9,8 @@
+ 
+ #include "msa.h"
+ #include <iostream>
++#include <functional>
++#include <memory>
+ 
+ // *******************************************************************************************
+ //
+@@ -22,6 +24,8 @@
+ 
+ 	RLE0_fwd_mode = stage_mode_t::forward;
+ 	RLE0_rev_mode = stage_mode_t::reverse;
++
++	sequential_max_cells = SEQUENTIAL_PIPELINE_MAX_CELLS;
+ }
+ 
+ // *******************************************************************************************
+@@ -65,6 +69,13 @@
+ bool CMSACompress::Compress(vector<vector<uint8_t>> &v_meta, vector<uint32_t> &v_offsets, vector<string> &v_names, vector<string> &v_sequences, vector<uint8_t> &v_compressed_data,
+ 	size_t &comp_text_size, size_t &comp_seq_size, bool _fast_variant)
+ {
++	string err;
++	if (!validate_sequences(v_names, v_sequences, err))
++	{
++		cerr << "Error: " << err << endl;
++		return false;
++	}
++
+ 	v_text.clear();
+ 	append_text(v_meta);
+ 	append_text(v_names);
+@@ -83,6 +94,13 @@
+ bool CMSACompress::Compress(vector<string> &v_names, vector<string> &v_sequences, vector<uint8_t> &v_compressed_data,
+ 	size_t &comp_text_size, size_t &comp_seq_size, bool _fast_variant)
+ {
++	string err;
++	if (!validate_sequences(v_names, v_sequences, err))
++	{
++		cerr << "Error: " << err << endl;
++		return false;
++	}
++
+ 	v_text.clear();
+ 	append_text(v_names);
+ 
+@@ -97,13 +115,12 @@
+ {
+ 	v_text.clear();
+ 
+-	decompress(v_text, v_sequences, v_compressed_data);
++	if (!decompress(v_text, v_sequences, v_compressed_data))
++		return false;
+ 	
+ 	v_text_pos = 0;
+ 
+-	load_text(v_names);
+-
+-	return true;
++	return load_text(v_names) && v_text_pos == v_text.size() && v_names.size() == v_sequences.size();
+ }
+ 
+ // *******************************************************************************************
+@@ -111,13 +128,18 @@
+ bool CMSACompress::Decompress(vector<uint8_t> &v_compressed_data, vector<vector<uint8_t>> &v_meta, vector<uint32_t> &v_offsets, vector<string> &v_names, vector<string> &v_sequences)
+ {
+ 	v_text.clear();
+-	decompress(v_text, v_sequences, v_compressed_data);
++
++	if (!decompress(v_text, v_sequences, v_compressed_data))
++		return false;
+ 
+ 	v_text_pos = 0;
+ 		
+-	load_text(v_meta);
+-	load_text(v_names);
+-	load_text(v_offsets);
++	if (!load_text(v_meta) || !load_text(v_names) || !load_text(v_offsets) || v_text_pos != v_text.size())
++		return false;
++
++	// Each sequence needs a name and the offsets must refer to existing metadata lines
++	if (v_names.size() != v_sequences.size() || v_offsets.size() > v_meta.size())
++		return false;
+ 
+ 	return true;
+ }
+@@ -180,15 +202,14 @@
+ 
+ // *******************************************************************************************
+ // Load text from metadata string
+-void CMSACompress::load_text(vector<string> &vs)
++bool CMSACompress::load_text(vector<string> &vs)
+ {
+ 	size_t len;
+ 
+ 	vs.clear();
+ 
+-	len = load_uint(v_text, v_text_pos);
+-
+-	vs.reserve(vs.size() + len);
++	if (!load_uint(v_text, v_text_pos, len) || len > v_text.size() - v_text_pos)
++		return false;
+ 
+ 	vs.push_back("");
+ 
+@@ -204,19 +225,20 @@
+ 
+ 	if (vs.back().empty())
+ 		vs.pop_back();
++
++	return true;
+ }
+ 
+ // *******************************************************************************************
+ // Load text from metadata string
+-void CMSACompress::load_text(vector<vector<uint8_t>> &vs)
++bool CMSACompress::load_text(vector<vector<uint8_t>> &vs)
+ {
+ 	size_t len;
+ 
+ 	vs.clear();
+ 
+-	len = load_uint(v_text, v_text_pos);
+-
+-	vs.reserve(vs.size() + len);
++	if (!load_uint(v_text, v_text_pos, len) || len > v_text.size() - v_text_pos)
++		return false;
+ 
+ 	vs.push_back(vector<uint8_t>());
+ 
+@@ -232,22 +254,55 @@
+ 
+ 	if (vs.back().empty())
+ 		vs.pop_back();
++
++	return true;
+ } 
+ 
+ // *******************************************************************************************
+ // Load text from metadata string
+-void CMSACompress::load_text(vector<uint32_t> &vu)
++bool CMSACompress::load_text(vector<uint32_t> &vu)
+ {
+ 	size_t len;
+ 
+ 	vu.clear();
+ 
+-	len = load_uint(v_text, v_text_pos);
++	// Each value takes at least 1 byte
++	if (!load_uint(v_text, v_text_pos, len) || len > v_text.size() - v_text_pos)
++		return false;
+ 
+ 	vu.reserve(len);
+ 
+ 	for (size_t i = 0; i < len; ++i)
+-		vu.push_back((uint32_t) load_uint(v_text, v_text_pos));
++	{
++		size_t x;
++		if (!load_uint(v_text, v_text_pos, x))
++			return false;
++		vu.push_back((uint32_t) x);
++	}
++
++	return true;
++}
++
++// *******************************************************************************************
++// Run pipeline stages: each in its own thread or (for small data) one after another in the
++// calling thread. In the latter case the stages must be given in the data-flow order.
++static void run_stages(vector<function<void()>> &v_stages, bool sequential)
++{
++	if (sequential)
++	{
++		for (auto &stage : v_stages)
++			stage();
++		return;
++	}
++
++	vector<thread> v_threads;
++	v_threads.reserve(v_stages.size());
++
++	for (auto &stage : v_stages)
++		v_threads.emplace_back(stage);
++
++	for (auto &t : v_threads)
++		t.join();
+ }
+ 
+ // *******************************************************************************************
+@@ -275,110 +330,84 @@
+ 	else
+ 		ctx_length = ctx_length_t::huge;		// 5, 3, 2
+ 
++	bool sequential = file_size < sequential_max_cells;
++
+ 	// Queues
+ #ifdef _DEBUG
+ 	int n_thr_ss = 1;
+ #else
+-	int n_thr_ss = fast_variant ? 2 : 4;	
++	int n_thr_ss = sequential ? 1 : fast_variant ? 2 : 4;	
+ #endif
+ 
++	vector<function<void()>> v_stages;
++
+ 	// Text data - sequence names and (optional) metadata
+ 	v_text_compressed.clear();
+-	CLZMAWrapper *lzma = new CLZMAWrapper(&v_text, &v_text_compressed, true, LZMA_mode);
+-	thread *thr_lzma = new thread(std::ref(*lzma));
++	CLZMAWrapper lzma(&v_text, &v_text_compressed, true, LZMA_mode);
++	v_stages.push_back(std::ref(lzma));
++
++	bool transpose_failed = false;
+ 
+ 	if (!v_sequences.empty())
+ 	{
+ 		// Sequence data
+-		CRegisteringPriorityQueue<vector<string> *> *q_pre_transpose = new CRegisteringPriorityQueue<vector<string> *>(1);
+-		CRegisteringPriorityQueue<string> *q_post_transpose = new CRegisteringPriorityQueue<string>(1);
+-		CRegisteringPriorityQueue<string> *q_post_PBWT = new CRegisteringPriorityQueue<string>(1);
+-		CRegisteringPriorityQueue<string> *q_post_SS = new CRegisteringPriorityQueue<string>(n_thr_ss);
+-		CRegisteringPriorityQueue<string> *q_post_RLE = new CRegisteringPriorityQueue<string>(1);
+-		CVectorIOStream *v_post_entropy = new CVectorIOStream(v_seq_compressed);
++		CRegisteringPriorityQueue<vector<string> *> q_pre_transpose(1);
++		CRegisteringPriorityQueue<string> q_post_transpose(1);
++		CRegisteringPriorityQueue<string> q_post_PBWT(1);
++		CRegisteringPriorityQueue<string> q_post_SS(n_thr_ss);
++		CRegisteringPriorityQueue<string> q_post_RLE(1);
++		CVectorIOStream v_post_entropy(v_seq_compressed);
++
++		// Push input sequences into the first queue
++		q_pre_transpose.Push(0, &v_sequences);
++		q_pre_transpose.MarkCompleted();
+ 
+ 		// Transpose
+-		CTranspose *transpose = new CTranspose(q_pre_transpose, q_post_transpose, 0, 0, true);
+-		thread *thr_transpose = new thread(std::ref(*transpose));
++		CTranspose transpose(&q_pre_transpose, &q_post_transpose, 0, 0, true);
++		v_stages.push_back(std::ref(transpose));
+ 
+ 		// PBWT
+-		CPBWT *pbwt = new CPBWT(q_post_transpose, q_post_PBWT, PBWT_fwd_mode);
+-		thread *thr_pbwt = new thread(std::ref(*pbwt));
+-
+-		vector<CSecondStage *> v_ss(n_thr_ss);
+-		vector<thread *> v_thr_ss(n_thr_ss);
++		CPBWT pbwt(&q_post_transpose, &q_post_PBWT, PBWT_fwd_mode);
++		v_stages.push_back(std::ref(pbwt));
+ 
+-		if (fast_variant)
+-		{
+-			// MTF
+-			for (int i = 0; i < n_thr_ss; ++i)
+-			{
+-				v_ss[i] = new CMTF(q_post_PBWT, q_post_SS, SS_fwd_mode);
+-				v_thr_ss[i] = new thread(std::ref(*(v_ss[i])));
+-			}
+-		}
+-		else
++		// MTF or WFC
++		vector<unique_ptr<CSecondStage>> v_ss;
++		for (int i = 0; i < n_thr_ss; ++i)
+ 		{
+-			// WFC
+-			for (int i = 0; i < n_thr_ss; ++i)
+-			{
+-				v_ss[i] = new CWFC(q_post_PBWT, q_post_SS, SS_fwd_mode);
+-				v_thr_ss[i] = new thread(std::ref(*(v_ss[i])));
+-			}
++			if (fast_variant)
++				v_ss.emplace_back(new CMTF(&q_post_PBWT, &q_post_SS, SS_fwd_mode));
++			else
++				v_ss.emplace_back(new CWFC(&q_post_PBWT, &q_post_SS, SS_fwd_mode));
++			CSecondStage *ss = v_ss.back().get();
++			v_stages.push_back([ss] { (*ss)(); });
+ 		}
+ 
+ 		// RLE-0
+-		CRLE *rle = new CRLE(q_post_SS, q_post_RLE, RLE0_fwd_mode);
+-		thread *thr_rle = new thread(std::ref(*rle));
++		CRLE rle(&q_post_SS, &q_post_RLE, RLE0_fwd_mode);
++		v_stages.push_back(std::ref(rle));
+ 
+ 		// Entropy
+-		CEntropy *entropy = new CEntropy(q_post_RLE, v_post_entropy, pre_entropy_sequences_size, 0, true, ctx_length);
+-		thread *thr_entropy = new thread(std::ref(*entropy));
+-
+-		// Push input sequences into the first queue
+-		q_pre_transpose->Push(0, &v_sequences);
+-
+-		q_pre_transpose->MarkCompleted();
+-
+-		thr_transpose->join();
+-		thr_pbwt->join();
+-		for (auto &x : v_thr_ss)
+-			x->join();
+-		thr_rle->join();
+-		thr_entropy->join();
++		CEntropy entropy(&q_post_RLE, &v_post_entropy, pre_entropy_sequences_size, 0, true, ctx_length);
++		v_stages.push_back(std::ref(entropy));
+ 
+-		delete transpose;
+-		delete thr_transpose;
++		run_stages(v_stages, sequential);
+ 
+-		delete pbwt;
+-		delete thr_pbwt;
+-
+-		for (int i = 0; i < n_thr_ss; ++i)
+-		{
+-			delete v_ss[i];
+-			delete v_thr_ss[i];
+-		}
+-
+-		delete rle;
+-		delete thr_rle;
+-
+-		delete entropy;
+-		delete thr_entropy;
+-
+-		delete q_pre_transpose;
+-		delete q_post_transpose;
+-		delete q_post_PBWT;
+-		delete q_post_SS;
+-		delete q_post_RLE;
+-		delete v_post_entropy;
++		transpose_failed = transpose.Failed();
+ 	}
+ 	else
++	{
+ 		pre_entropy_sequences_size = 0;
++		run_stages(v_stages, true);
++	}
+ 
+-	thr_lzma->join();
++	if (transpose_failed)
++	{
++		cerr << "Error: sequences are of different lengths\n";
++		return false;
++	}
+ 
+-	delete lzma;
+-	delete thr_lzma;
++	if (!lzma.Success())
++		return false;
+ 
+ 	store_data_in_stream(ctx_length, fast_variant, v_seq_compressed, v_text_compressed, pre_entropy_sequences_size, 
+ 		(uint32_t) v_sequences.size(), pre_entropy_sequences_size ? (uint32_t) v_sequences.front().size(): 0, v_compressed_data);
+@@ -411,11 +440,14 @@
+ 
+ // *******************************************************************************************
+ // Load some extra values from the compressed stream
+-void CMSACompress::load_data_from_stream(ctx_length_t &ctx_length, bool &fast_variant, vector<uint8_t> &v_seq_compressed, vector<uint8_t> &v_text_compressed, size_t &pre_entropy_sequences_size, 
++bool CMSACompress::load_data_from_stream(ctx_length_t &ctx_length, bool &fast_variant, vector<uint8_t> &v_seq_compressed, vector<uint8_t> &v_text_compressed, size_t &pre_entropy_sequences_size, 
+ 	uint32_t &n_sequences, uint32_t &n_columns, vector<uint8_t> &v_compressed_data)
+ {
+ 	size_t vu_pos = 0;
+ 
++	if (v_compressed_data.empty())
++		return false;
++
+ 	uint8_t t = v_compressed_data[vu_pos++];
+ 
+ 	if (t & 64)
+@@ -425,20 +457,33 @@
+ 	}
+ 	else
+ 		fast_variant = false;
++
++	if (t > (uint8_t) ctx_length_t::huge)
++		return false;
+ 	ctx_length = (ctx_length_t)t;
+ 
+-	n_sequences = (uint32_t) load_uint(v_compressed_data, vu_pos);
+-	n_columns = (uint32_t) load_uint(v_compressed_data, vu_pos);
+-	size_t v_text_compressed_size = load_uint(v_compressed_data, vu_pos);
+-	size_t v_seq_compressed_size = load_uint(v_compressed_data, vu_pos);
+-	pre_entropy_sequences_size = load_uint(v_compressed_data, vu_pos);
++	size_t x_n_sequences, x_n_columns, v_text_compressed_size, v_seq_compressed_size;
++
++	if (!load_uint(v_compressed_data, vu_pos, x_n_sequences) || !load_uint(v_compressed_data, vu_pos, x_n_columns) ||
++		!load_uint(v_compressed_data, vu_pos, v_text_compressed_size) || !load_uint(v_compressed_data, vu_pos, v_seq_compressed_size) ||
++		!load_uint(v_compressed_data, vu_pos, pre_entropy_sequences_size))
++		return false;
+ 
+-	v_text_compressed.resize(v_text_compressed_size);
+-	v_seq_compressed.resize(v_seq_compressed_size);
++	if (x_n_sequences > UINT32_MAX || x_n_columns > UINT32_MAX)
++		return false;
+ 
+-	copy_n(v_compressed_data.data() + vu_pos, v_text_compressed_size, v_text_compressed.data());
++	n_sequences = (uint32_t) x_n_sequences;
++	n_columns = (uint32_t) x_n_columns;
++
++	if (v_text_compressed_size > v_compressed_data.size() - vu_pos ||
++		v_seq_compressed_size != v_compressed_data.size() - vu_pos - v_text_compressed_size)
++		return false;
++
++	v_text_compressed.assign(v_compressed_data.begin() + vu_pos, v_compressed_data.begin() + vu_pos + v_text_compressed_size);
+ 	vu_pos += v_text_compressed_size;
+-	copy_n(v_compressed_data.data() + vu_pos, v_seq_compressed_size, v_seq_compressed.data());
++	v_seq_compressed.assign(v_compressed_data.begin() + vu_pos, v_compressed_data.end());
++
++	return true;
+ }
+ 
+ // *******************************************************************************************
+@@ -464,20 +509,26 @@
+ 
+ // *******************************************************************************************
+ // Load single unsigned integer from the compressed stream
+-size_t CMSACompress::load_uint(vector<uint8_t> &vu, size_t &vu_pos)
++bool CMSACompress::load_uint(vector<uint8_t> &vu, size_t &vu_pos, size_t &x)
+ {
+ 	uint32_t shift = 0;
+-	size_t x = 0;
++	x = 0;
++
++	if (vu_pos >= vu.size())
++		return false;
+ 
+ 	uint32_t n_bytes = vu[vu_pos++];
+ 
++	if (n_bytes > sizeof(size_t) || n_bytes > vu.size() - vu_pos)
++		return false;
++
+ 	for (uint32_t i = 0; i < n_bytes; ++i)
+ 	{
+ 		x += ((size_t)vu[vu_pos++]) << shift;
+ 		shift += 8;
+ 	}
+ 
+-	return x;
++	return true;
+ }
+ 
+ // *******************************************************************************************
+@@ -492,114 +543,98 @@
+ 	uint32_t n_columns;
+ 	ctx_length_t ctx_length;
+ 
+-	load_data_from_stream(ctx_length, fast_variant, v_seq_compressed, v_text_compressed, pre_entropy_sequences_size, n_sequences, n_columns, v_compressed_data);
++	if (!load_data_from_stream(ctx_length, fast_variant, v_seq_compressed, v_text_compressed, pre_entropy_sequences_size, n_sequences, n_columns, v_compressed_data))
++		return false;
++
++	if (pre_entropy_sequences_size)
++	{
++		// Sanity checks (protect against huge allocations for corrupted data): every column takes at least
++		// one symbol and a column of n symbols takes at least floor(log2(n + 1)) symbols
++		if (n_sequences == 0 || n_columns == 0 || n_columns > pre_entropy_sequences_size)
++			return false;
++		size_t min_symbols_per_column = 0;
++		for (uint64_t t = (uint64_t) n_sequences + 1; t > 1; t >>= 1)
++			++min_symbols_per_column;
++		if (min_symbols_per_column * n_columns > pre_entropy_sequences_size)
++			return false;
++	}
++
++	bool sequential = (uint64_t) n_sequences * n_columns < sequential_max_cells;
+ 
+ #ifdef _DEBUG
+ 	int n_thr_ss = 1;
+ #else
+-	int n_thr_ss = fast_variant ? 2 : 4;
++	int n_thr_ss = sequential ? 1 : fast_variant ? 2 : 4;
+ #endif
+ 
++	vector<function<void()>> v_stages;
++
+ 	// Names and meta
+-	CLZMAWrapper *lzma = new CLZMAWrapper(&v_text, &v_text_compressed, false, 0);
+-	thread *thr_lzma = new thread(std::ref(*lzma));
++	CLZMAWrapper lzma(&v_text, &v_text_compressed, false, 0);
++	v_stages.push_back(std::ref(lzma));
++
++	bool seq_failed = false;
+ 
+ 	if (pre_entropy_sequences_size)
+ 	{
+-		CVectorIOStream *v_pre_entropy = new CVectorIOStream(v_seq_compressed);
+-		CRegisteringPriorityQueue<string> *q_post_entropy = new CRegisteringPriorityQueue<string>(1);
+-		CRegisteringPriorityQueue<string> *q_post_RLE = new CRegisteringPriorityQueue<string>(1);
+-		CRegisteringPriorityQueue<string> *q_post_SS = new CRegisteringPriorityQueue<string>(n_thr_ss);
+-		CRegisteringPriorityQueue<string> *q_post_PBWT = new CRegisteringPriorityQueue<string>(1);
+-		CRegisteringPriorityQueue<vector<string> *> *q_post_transpose = new CRegisteringPriorityQueue<vector<string> *>(1);
++		CVectorIOStream v_pre_entropy(v_seq_compressed);
++		CRegisteringPriorityQueue<string> q_post_entropy(1);
++		CRegisteringPriorityQueue<string> q_post_RLE(1);
++		CRegisteringPriorityQueue<string> q_post_SS(n_thr_ss);
++		CRegisteringPriorityQueue<string> q_post_PBWT(1);
++		CRegisteringPriorityQueue<vector<string> *> q_post_transpose(1);
+ 
+ 		// Entropy
+-		CEntropy *entropy = new CEntropy(q_post_entropy, v_pre_entropy, pre_entropy_sequences_size, n_sequences, false, ctx_length);
+-		thread *thr_entropy = new thread(std::ref(*entropy));
++		CEntropy entropy(&q_post_entropy, &v_pre_entropy, pre_entropy_sequences_size, n_sequences, false, ctx_length);
++		v_stages.push_back(std::ref(entropy));
+ 
+ 		// RLE-0
+-		CRLE *rle = new CRLE(q_post_entropy, q_post_RLE, RLE0_rev_mode);
+-		thread *thr_rle = new thread(std::ref(*rle));
++		CRLE rle(&q_post_entropy, &q_post_RLE, RLE0_rev_mode);
++		v_stages.push_back(std::ref(rle));
+ 
+-		vector<CSecondStage *> v_ss(n_thr_ss);
+-		vector<thread *> v_thr_ss(n_thr_ss);
+-
+-		if (fast_variant)
+-		{
+-			// MTF
+-			for (int i = 0; i < n_thr_ss; ++i)
+-			{
+-				v_ss[i] = new CMTF(q_post_RLE, q_post_SS, SS_rev_mode);
+-				v_thr_ss[i] = new thread(std::ref(*(v_ss[i])));
+-			}
+-		}
+-		else
++		// MTF or WFC
++		vector<unique_ptr<CSecondStage>> v_ss;
++		for (int i = 0; i < n_thr_ss; ++i)
+ 		{
+-			// WFC
+-			for (int i = 0; i < n_thr_ss; ++i)
+-			{
+-				v_ss[i] = new CWFC(q_post_RLE, q_post_SS, SS_rev_mode);
+-				v_thr_ss[i] = new thread(std::ref(*(v_ss[i])));
+-			}
++			if (fast_variant)
++				v_ss.emplace_back(new CMTF(&q_post_RLE, &q_post_SS, SS_rev_mode));
++			else
++				v_ss.emplace_back(new CWFC(&q_post_RLE, &q_post_SS, SS_rev_mode));
++			CSecondStage *ss = v_ss.back().get();
++			v_stages.push_back([ss] { (*ss)(); });
+ 		}
+ 
+ 		// PBWT
+-		CPBWT *pbwt = new CPBWT(q_post_SS, q_post_PBWT, PBWT_rev_mode);
+-		thread *thr_pbwt = new thread(std::ref(*pbwt));
++		CPBWT pbwt(&q_post_SS, &q_post_PBWT, PBWT_rev_mode);
++		v_stages.push_back(std::ref(pbwt));
+ 
+ 		// Transpose
+-		CTranspose *transpose = new CTranspose(q_post_transpose, q_post_PBWT, n_sequences, n_columns, false);
+-		thread *thr_transpose = new thread(std::ref(*transpose));
++		CTranspose transpose(&q_post_transpose, &q_post_PBWT, n_sequences, n_columns, false);
++		v_stages.push_back(std::ref(transpose));
+ 
+-		thr_entropy->join();
+-		thr_rle->join();
+-		for (auto &x : v_thr_ss)
+-			x->join();
+-
+-		thr_pbwt->join();
+-		thr_transpose->join();
++		run_stages(v_stages, sequential);
+ 
+ 		vector<string> *matrix = nullptr;
+ 		uint64_t priority;
+-		q_post_transpose->Pop(priority, matrix);
+-		v_sequences.resize(matrix->size());
+-
+-		for (size_t i = 0; i < matrix->size(); ++i)
+-			v_sequences[i] = move((*matrix)[i]);
+-
+-		delete entropy;
+-		delete thr_entropy;
++		q_post_transpose.Pop(priority, matrix);
+ 
+-		delete rle;
+-		delete thr_rle;
++		seq_failed = entropy.Failed() || transpose.Failed() || !matrix;
+ 
+-		for (int i = 0; i < n_thr_ss; ++i)
++		if (matrix)
+ 		{
+-			delete v_ss[i];
+-			delete v_thr_ss[i];
++			v_sequences = move(*matrix);
++			delete matrix;
+ 		}
+-
+-		delete pbwt;
+-		delete thr_pbwt;
+-
+-		delete transpose;
+-		delete thr_transpose;
+-
+-		delete v_pre_entropy;
+-		delete q_post_entropy;
+-		delete q_post_RLE;
+-		delete q_post_SS;
+-		delete q_post_PBWT;
+-		delete q_post_transpose;
+ 	}
+ 	else
+-		v_sequences.clear();
++	{
++		run_stages(v_stages, true);
+ 
+-	thr_lzma->join();
+-	delete lzma;
+-	delete thr_lzma;
++		// Sequences can be present but empty
++		v_sequences.assign(n_sequences, string());
++	}
+ 
+-	return true;
++	return !seq_failed && lzma.Success();
+ }
+ 
+ // EOF
+diff -ruN -x '*.o' -x CoMSA -x libs -x lzma -x '*.vcxproj*' -x sample CoMSA-1.1/src/msa.h CoMSA-1.1.fixed/src/msa.h
+--- CoMSA-1.1/src/msa.h	2018-04-12 01:17:30.000000000 -0700
++++ CoMSA-1.1.fixed/src/msa.h	2026-10-29 13:41:00.768535556 -0700
+@@ -26,6 +26,12 @@
+ const uint32_t LZMA_mode_FASTA = 9 | LZMA_PRESET_EXTREME;
+ const uint32_t LZMA_mode_Stockholm = 9;
+ 
++// Families smaller than this (no. of sequences * no. of columns) are processed by running the
++// pipeline stages one after another in the calling thread instead of spawning a thread per stage.
++// The larger value is for the case when several families are processed in parallel.
++const size_t SEQUENTIAL_PIPELINE_MAX_CELLS = 256 << 10;
++const size_t SEQUENTIAL_PIPELINE_MAX_CELLS_PARALLEL = 4 << 20;
++
+ // *******************************************************************************************
+ //
+ // *******************************************************************************************
+@@ -42,6 +48,7 @@
+ 
+ 	size_t pre_entropy_sequences_size;
+ 	bool fast_variant;
++	size_t sequential_max_cells;
+ 
+ 	bool compress(vector<uint8_t> &v_text, vector<string> &v_sequences, uint32_t LZMA_mode, vector<uint8_t> &v_compressed_data,
+ 		size_t &comp_text_size, size_t &comp_seq_size);
+@@ -51,22 +58,27 @@
+ 	void append_text(vector<vector<uint8_t>> &vs);
+ 	void append_text(vector<uint32_t> &vu);
+ 
+-	void load_text(vector<string> &vs);
+-	void load_text(vector<vector<uint8_t>> &vs);
+-	void load_text(vector<uint32_t> &vu);
++	bool load_text(vector<string> &vs);
++	bool load_text(vector<vector<uint8_t>> &vs);
++	bool load_text(vector<uint32_t> &vu);
+ 
+ 	void store_uint(vector<uint8_t> &vu, size_t x);
+-	size_t load_uint(vector<uint8_t> &vu, size_t &vu_pos);
++	bool load_uint(vector<uint8_t> &vu, size_t &vu_pos, size_t &x);
+ 
+ 	void store_data_in_stream(ctx_length_t ctx_length, bool fast_variant, vector<uint8_t> &v_seq_compressed, vector<uint8_t> &v_text_compressed, size_t pre_entropy_sequences_size,
+ 		uint32_t n_sequences, uint32_t n_columns, vector<uint8_t> &v_compressed_data);
+-	void load_data_from_stream(ctx_length_t &ctx_length, bool &fast_variant, vector<uint8_t> &v_seq_compressed, vector<uint8_t> &v_text_compressed, size_t &pre_entropy_sequences_size,
++	bool load_data_from_stream(ctx_length_t &ctx_length, bool &fast_variant, vector<uint8_t> &v_seq_compressed, vector<uint8_t> &v_text_compressed, size_t &pre_entropy_sequences_size,
+ 		uint32_t &n_sequences, uint32_t &n_columns, vector<uint8_t> &v_compressed_data);
+ 
+ public:
+ 	CMSACompress();
+ 	~CMSACompress();
+ 
++	void SetSequentialMaxCells(size_t _sequential_max_cells)
++	{
++		sequential_max_cells = _sequential_max_cells;
++	}
++
+ #ifdef EXPERIMENTAL_MODE
+ 	void SetCopyModes(bool PBWT_mode, bool SS_mode, bool RLE0_mode);
+ #endif
+diff -ruN -x '*.o' -x CoMSA -x libs -x lzma -x '*.vcxproj*' -x sample CoMSA-1.1/src/mtf.cpp CoMSA-1.1.fixed/src/mtf.cpp
+--- CoMSA-1.1/src/mtf.cpp	2018-04-12 01:17:30.000000000 -0700
++++ CoMSA-1.1.fixed/src/mtf.cpp	2026-10-29 13:30:30.702682807 -0700
+@@ -181,7 +181,7 @@
+ 			dest[pos++] = x;
+ 		}
+ 
+-		out->Push(priority, dest);
++		out->Push(priority, std::move(dest));
+ 	}
+ 
+ 	out->MarkCompleted();
+@@ -238,7 +238,7 @@
+ 			dest[pos++] = c;
+ 		}
+ 
+-		out->Push(priority, dest);
++		out->Push(priority, std::move(dest));
+ 	}
+ 
+ 	out->MarkCompleted();
+@@ -248,25 +248,13 @@
+ // Run processing
+ void CMTF::operator()()
+ {
+-	v_legal_symbols.clear();
+-
+-	v_legal_symbols.push_back('-');
+-	v_legal_symbols.push_back('.');
+-	for (int c = 'A'; c <= 'Z'; ++c)
+-		v_legal_symbols.push_back(c);
+-	for (int c = 'a'; c <= 'z'; ++c)
+-		v_legal_symbols.push_back(c);
+-	v_legal_symbols.push_back('*');
+-
+-	for (int i = 0; i < 128; ++i)
+-		if (count(v_legal_symbols.begin(), v_legal_symbols.end(), i) == 0)
+-			v_legal_symbols.push_back(i);
++	v_legal_symbols = legal_symbol_order();
+ 
+ 	if (stage_mode == stage_mode_t::forward)
+ 		forward();
+ 	else if(stage_mode == stage_mode_t::reverse)
+ 		reverse();
+-	else if (stage_mode == stage_mode_t::copy_forward && stage_mode == stage_mode_t::copy_reverse)
++	else if (stage_mode == stage_mode_t::copy_forward || stage_mode == stage_mode_t::copy_reverse)
+ 		direct_copy();
+ }
+ 
+diff -ruN -x '*.o' -x CoMSA -x libs -x lzma -x '*.vcxproj*' -x sample CoMSA-1.1/src/pbwt.cpp CoMSA-1.1.fixed/src/pbwt.cpp
+--- CoMSA-1.1/src/pbwt.cpp	2018-04-12 01:17:30.000000000 -0700
++++ CoMSA-1.1.fixed/src/pbwt.cpp	2026-10-29 13:30:30.702682807 -0700
+@@ -9,6 +9,7 @@
+ 
+ #include <iostream>
+ #include <numeric>
++#include <array>
+ #include "pbwt.h"
+ 
+ // *******************************************************************************************
+@@ -17,6 +18,8 @@
+ {
+ 	string src, dest;
+ 	uint64_t priority;
++	array<int, 256> n_occ;
++	array<int, 256> n_sum_occ;
+ 
+ 	while (!in->IsCompleted())
+ 	{
+@@ -34,19 +37,19 @@
+ 		}
+ 
+ 		// Build histogram
+-		vector<int> n_occ(128, 0);
++		n_occ.fill(0);
+ 
+ 		for (auto c : src)
+-			++n_occ[c];
++			++n_occ[(uint8_t) c];
+ 
+-		vector<int> n_sum_occ(128, 0);
+-		for (int i = 1; i < 128; ++i)
++		n_sum_occ[0] = 0;
++		for (int i = 1; i < 256; ++i)
+ 			n_sum_occ[i] = n_sum_occ[i - 1] + n_occ[i - 1];
+ 
+ 		// Determine new ordering
+ 		for (size_t i = 0; i < prev_ordering.size(); ++i)
+ 		{
+-			int c_symbol = src[prev_ordering[i]];
++			int c_symbol = (uint8_t) src[prev_ordering[i]];
+ 			int c_pos = n_sum_occ[c_symbol]++;
+ 
+ 			curr_ordering[c_pos] = prev_ordering[i];
+@@ -55,7 +58,8 @@
+ 
+ 		prev_ordering.swap(curr_ordering);
+ 
+-		out->Push(priority, dest);
++		out->Push(priority, std::move(dest));
++		dest.clear();
+ 	}
+ 
+ 	out->MarkCompleted();
+@@ -85,6 +89,8 @@
+ {
+ 	string src, dest;
+ 	uint64_t priority;
++	array<int, 256> n_occ;
++	array<int, 256> n_sum_occ;
+ 
+ 	int n_vec = 0;
+ 
+@@ -106,23 +112,23 @@
+ 		}
+ 
+ 		// Build histogram
+-		vector<int> n_occ(128, 0);
++		n_occ.fill(0);
+ 
+ 		// Permute
+ 		for (size_t i = 0; i < prev_ordering.size(); ++i)
+ 			dest[prev_ordering[i]] = src[i];
+ 
+ 		for (auto c : dest)
+-			++n_occ[c];
++			++n_occ[(uint8_t) c];
+ 
+-		vector<int> n_sum_occ(128, 0);
+-		for (int i = 1; i < 128; ++i)
++		n_sum_occ[0] = 0;
++		for (int i = 1; i < 256; ++i)
+ 			n_sum_occ[i] = n_sum_occ[i - 1] + n_occ[i - 1];
+ 
+ 		// Determine new ordering
+ 		for (size_t i = 0; i < prev_ordering.size(); ++i)
+ 		{
+-			int c_symbol = dest[prev_ordering[i]];
++			int c_symbol = (uint8_t) dest[prev_ordering[i]];
+ 			int c_pos = n_sum_occ[c_symbol]++;
+ 
+ 			curr_ordering[c_pos] = prev_ordering[i];
+@@ -130,7 +136,8 @@
+ 
+ 		prev_ordering.swap(curr_ordering);
+ 
+-		out->Push(priority, dest);
++		out->Push(priority, std::move(dest));
++		dest.clear();
+ 	}
+ 
+ 	out->MarkCompleted();
+diff -ruN -x '*.o' -x CoMSA -x libs -x lzma -x '*.vcxproj*' -x sample CoMSA-1.1/src/queue.h CoMSA-1.1.fixed/src/queue.h
+--- CoMSA-1.1/src/queue.h	2018-04-12 01:17:30.000000000 -0700
++++ CoMSA-1.1.fixed/src/queue.h	2026-10-29 13:30:30.702682807 -0700
+@@ -14,6 +14,8 @@
+ #include <mutex>
+ #include <condition_variable>
+ #include <atomic>
++#include <utility>
++#include <cstdint>
+ 
+ using namespace std;
+ 
+@@ -23,7 +25,16 @@
+ // *******************************************************************************************
+ template<typename T> class CRegisteringPriorityQueue
+ {
+-	typedef priority_queue<pair<uint64_t, T>, vector<pair<uint64_t, T>>, greater<pair<uint64_t, T>>> priority_queue_t;
++	// Priorities are unique, so comparing them alone is enough (and avoids comparing payloads)
++	struct cmp_priority_t
++	{
++		bool operator()(const pair<uint64_t, T> &a, const pair<uint64_t, T> &b) const
++		{
++			return a.first > b.first;
++		}
++	};
++
++	typedef priority_queue<pair<uint64_t, T>, vector<pair<uint64_t, T>>, cmp_priority_t> priority_queue_t;
+ 
+ 	priority_queue_t q;
+ 	bool is_completed;
+@@ -84,7 +95,7 @@
+ 	{
+ 		unique_lock<mutex> lck(mtx);
+ 		bool was_empty = is_empty();
+-		q.push(make_pair(priority, data));
++		q.push(make_pair(priority, std::move(data)));
+ 		++n_elements;
+ 
+ 		if (was_empty)
+@@ -99,7 +110,8 @@
+ 			return false;
+ 
+ 		priority = q.top().first;
+-		data = q.top().second;
++		// The top element is removed right away, so it is safe to move from it
++		data = std::move(const_cast<pair<uint64_t, T> &>(q.top()).second);
+ 		q.pop();
+ 		--n_elements;
+ 		++c_priority;
+diff -ruN -x '*.o' -x CoMSA -x libs -x lzma -x '*.vcxproj*' -x sample CoMSA-1.1/src/rc.h CoMSA-1.1.fixed/src/rc.h
+--- CoMSA-1.1/src/rc.h	2018-04-12 01:17:30.000000000 -0700
++++ CoMSA-1.1.fixed/src/rc.h	2026-10-29 13:30:55.431049080 -0700
+@@ -153,6 +153,8 @@
+ 		ltfreq = rcd->GetCumulativeFreq(totf);
+ 
+ 		int x = simple_model.GetSym(ltfreq);
++		if (x < 0)
++			return -1;			// Possible only for corrupted data
+ 
+ 		simple_model.GetFreq(x, syfreq, ltfreq, totf);
+ 		rcd->UpdateFrequency(syfreq, ltfreq, totf);
+diff -ruN -x '*.o' -x CoMSA -x libs -x lzma -x '*.vcxproj*' -x sample CoMSA-1.1/src/rle.cpp CoMSA-1.1.fixed/src/rle.cpp
+--- CoMSA-1.1/src/rle.cpp	2018-04-12 01:17:30.000000000 -0700
++++ CoMSA-1.1.fixed/src/rle.cpp	2026-10-29 13:30:30.702682807 -0700
+@@ -66,7 +66,7 @@
+ 		n_vec++;
+ 
+ 		dest.pop_back();		// remove sentinel
+-		out->Push(priority, dest);
++		out->Push(priority, std::move(dest));
+ 	}
+ 
+ 	out->MarkCompleted();
+@@ -92,7 +92,7 @@
+ 			else
+ 				dest.push_back(x+1);
+ 
+-		out->Push(priority, dest);
++		out->Push(priority, std::move(dest));
+ 	}
+ 
+ 	out->MarkCompleted();
+@@ -145,7 +145,7 @@
+ 		}
+ 
+ 		dest.pop_back();		// remove sentinel
+-		out->Push(priority, dest);
++		out->Push(priority, std::move(dest));
+ 	}
+ 
+ 	out->MarkCompleted();
+@@ -171,7 +171,7 @@
+ 			else
+ 				dest.push_back(x-1);
+ 
+-		out->Push(priority, dest);
++		out->Push(priority, std::move(dest));
+ 	}
+ 
+ 	out->MarkCompleted();
+diff -ruN -x '*.o' -x CoMSA -x libs -x lzma -x '*.vcxproj*' -x sample CoMSA-1.1/src/ss.h CoMSA-1.1.fixed/src/ss.h
+--- CoMSA-1.1/src/ss.h	2018-04-12 01:17:30.000000000 -0700
++++ CoMSA-1.1.fixed/src/ss.h	2026-10-29 13:29:59.710477059 -0700
+@@ -8,6 +8,36 @@
+ // Date   : 2018-04-12
+ // *******************************************************************************************
+ 
++#include <vector>
++#include <algorithm>
++
++// *******************************************************************************************
++// Initial order of symbols in the second-stage (WFC/MTF) lists.
++// '~' was added after '*'; it does not change the ranks of the other valid symbols.
++inline const std::vector<int> &legal_symbol_order()
++{
++	static const std::vector<int> v_legal_symbols = [] {
++		std::vector<int> v;
++
++		v.push_back('-');
++		v.push_back('.');
++		for (int c = 'A'; c <= 'Z'; ++c)
++			v.push_back(c);
++		for (int c = 'a'; c <= 'z'; ++c)
++			v.push_back(c);
++		v.push_back('*');
++		v.push_back('~');
++
++		for (int i = 0; i < 128; ++i)
++			if (std::count(v.begin(), v.end(), i) == 0)
++				v.push_back(i);
++
++		return v;
++	}();
++
++	return v_legal_symbols;
++}
++
+ // *******************************************************************************************
+ //
+ // *******************************************************************************************
+diff -ruN -x '*.o' -x CoMSA -x libs -x lzma -x '*.vcxproj*' -x sample CoMSA-1.1/src/stockholm.cpp CoMSA-1.1.fixed/src/stockholm.cpp
+--- CoMSA-1.1/src/stockholm.cpp	2018-04-12 01:17:30.000000000 -0700
++++ CoMSA-1.1.fixed/src/stockholm.cpp	2026-10-29 13:35:15.147393139 -0700
+@@ -9,6 +9,7 @@
+ 
+ #include "stockholm.h"
+ #include <iostream>
++#include <unordered_set>
+ #include "defs.h"
+ 
+ using namespace std;
+@@ -33,9 +34,15 @@
+ 	if(!in->Open(file_name))
+ 	{
+ 		cerr << "Cannot open " << file_name << " file for reading\n";
++		delete in;
++		in = nullptr;
+ 		return false;
+ 	}
+ 
++	this->file_name = file_name;
++	family_no = 0;
++	failed = false;
++
+ 	return true;
+ }
+ 
+@@ -54,9 +61,13 @@
+ 	if (!out->Open(file_name))
+ 	{
+ 		cerr << "Cannot open " << file_name << " file for writing\n";
++		delete out;
++		out = nullptr;
+ 		return false;
+ 	}
+ 
++	this->file_name = file_name;
++
+ 	return true;
+ }
+ 
+@@ -76,13 +87,20 @@
+ 		in = nullptr;
+ 	}
+ 
++	bool success = true;
++
+ 	if (out)
+ 	{
++		if (!out->Close())
++		{
++			cerr << "Error while writing " << file_name << " file\n";
++			success = false;
++		}
+ 		delete out;
+ 		out = nullptr;
+ 	}
+ 
+-	return true;
++	return success;
+ }
+ 
+ // *******************************************************************************************
+@@ -108,7 +126,7 @@
+ {
+ 	while (!s.empty())
+ 	{
+-		if (s.front() == ' ' || s.front() == '\n' || s.front() == '\r')
++		if (s.front() == ' ' || s.front() == '\t' || s.front() == '\n' || s.front() == '\r')
+ 			s.erase(s.begin());
+ 		else
+ 			break;
+@@ -116,7 +134,7 @@
+ 
+ 	while (!s.empty())
+ 	{
+-		if (s.back() == ' ' || s.back() == '\n' || s.back() == '\r')
++		if (s.back() == ' ' || s.back() == '\t' || s.back() == '\n' || s.back() == '\r')
+ 			s.pop_back();
+ 		else
+ 			break;
+@@ -155,9 +173,9 @@
+ 				v_offsets.push_back(line_no - last_meta_line_no - 1);
+ 			last_meta_line_no = line_no;
+ 
+-			if (equal(GF_ID.begin(), GF_ID.end(), vu.begin()))
++			if (vu.size() >= GF_ID.size() && equal(GF_ID.begin(), GF_ID.end(), vu.begin()))
+ 				ID = trim(string(vu.begin() + GF_ID.size(), vu.end()));
+-			else if (equal(GF_AC.begin(), GF_AC.end(), vu.begin()))
++			else if (vu.size() >= GF_AC.size() && equal(GF_AC.begin(), GF_AC.end(), vu.begin()))
+ 				AC = trim(string(vu.begin() + GF_AC.size(), vu.end()));
+ 		}
+ 		else
+@@ -184,7 +202,46 @@
+ 		}
+ 	}
+ 
+-	return !v_sequences.empty() || !v_meta.empty();
++	if (v_sequences.empty() && v_meta.empty())
++		return false;
++
++	++family_no;
++
++	if (!validate_family(v_names, v_sequences, ID))
++	{
++		failed = true;
++		return false;
++	}
++
++	return true;
++}
++
++// *******************************************************************************************
++// Check that sequence names are unique and sequences are valid
++bool CStockholmFile::validate_family(vector<string> &v_names, vector<string> &v_sequences, const string &ID)
++{
++	string err;
++	string family = ID.empty() ? "no. " + to_string(family_no) : ID;
++
++	unordered_set<string> s_names;
++	for (auto &name : v_names)
++	{
++		string t = trim(name);
++		if (!s_names.insert(t).second)
++		{
++			cerr << "Error in " << file_name << ", family " << family << ": sequence " << t
++				<< " occurs more than once (interleaved/multi-block Stockholm is not supported)\n";
++			return false;
++		}
++	}
++
++	if (!validate_sequences(v_names, v_sequences, err))
++	{
++		cerr << "Error in " << file_name << ", family " << family << ": " << err << endl;
++		return false;
++	}
++
++	return true;
+ }
+ 
+ // *******************************************************************************************
+@@ -254,6 +311,8 @@
+ 	while (!in->Eof())
+ 	{
+ 		int c = in->Get();
++		if (c == EOF)
++			break;
+ 		if (c != '\n' && c != '\r')
+ 			vu.push_back((uint8_t)c);
+ 		else if (!vu.empty() || in->Eof())
+@@ -270,7 +329,7 @@
+ 
+ // *******************************************************************************************
+ // Open MSAC-compressed Stockholm file for reading
+-bool CCompressedStockholmFile::OpenForReading(string file_name)
++bool CCompressedStockholmFile::OpenForReading(string file_name, size_t buffer_size)
+ {
+ 	if (f)
+ 	{
+@@ -285,22 +344,43 @@
+ 		return false;
+ 	}
+ 
+-	my_fseek(f, -(long long)(sizeof(size_t)), SEEK_END);
+-	logical_file_size = my_ftell(f);
+-	size_t footer_size;
+-	load_uint(footer_size, true);
+-	logical_file_size -= (long long) footer_size;
++	writing = false;
++
++	// The buffer must be set up before any other operation on the stream
++	setvbuf(f, NULL, _IOFBF, buffer_size);
++
++	// The file ends with the footer (family descriptions) followed by the 8-byte footer size
++	my_fseek(f, 0, SEEK_END);
++	long long file_size = my_ftell(f);
++	size_t footer_size = 0;
++
++	bool ok = file_size >= (long long) sizeof(uint64_t);
++
++	if (ok)
++	{
++		my_fseek(f, -(long long)(sizeof(uint64_t)), SEEK_END);
++		load_uint(footer_size, true);
++		ok = !feof(f) && !ferror(f) && footer_size <= (size_t) file_size - sizeof(uint64_t);
++	}
+ 
+-	my_fseek(f, - (long long) (footer_size + sizeof(size_t)), SEEK_END);
++	if (ok)
++	{
++		logical_file_size = (size_t) file_size - sizeof(uint64_t) - footer_size;
++		my_fseek(f, (long long) logical_file_size, SEEK_SET);
++		ok = preload_family_descriptions(footer_size);
++	}
+ 
+-	// !!! Wczytanie opisu rodzin
+-	preload_family_descriptions(footer_size);
++	if (!ok)
++	{
++		cerr << file_name << " is not a valid compressed Stockholm file (truncated or corrupted)\n";
++		fclose(f);
++		f = nullptr;
++		return false;
++	}
+ 
+ 	my_fseek(f, 0, SEEK_SET);
+ 	file_pos = 0;
+ 
+-	setvbuf(f, NULL, _IOFBF, 128 << 20);
+-
+ 	return true;
+ }
+ 
+@@ -323,6 +403,7 @@
+ 
+ 	setvbuf(f, NULL, _IOFBF, 128 << 20);
+ 
++	writing = true;
+ 	file_pos = 0;
+ 
+ 	return true;
+@@ -338,10 +419,14 @@
+ 		return false;
+ 	}
+ 
+-	fclose(f);
++	bool success = !ferror(f);
++	success &= fclose(f) == 0;
+ 	f = nullptr;
+ 
+-	return true;
++	if (writing && !success)
++		cerr << "Error while writing compressed file\n";
++
++	return success;
+ }
+ 
+ // *******************************************************************************************
+@@ -380,22 +465,21 @@
+ 
+ 	size_t size = v_compressed_data.size();
+ 
+-	if (fwrite(&size, sizeof(size_t), 1, f) != 1)
+-		return false;
++	store_uint(size, true);
+ 
+-	file_pos += sizeof(size_t) + size;
++	file_pos += sizeof(uint64_t) + size;
+ 
+-	return fwrite(v_compressed_data.data(), 1, size, f) == size;
++	return fwrite(v_compressed_data.data(), 1, size, f) == size && !ferror(f);
+ }
+ 
+ // *******************************************************************************************
+-// Store single unsigned integer in the compressed stream
++// Store single unsigned integer in the compressed stream (little endian)
+ size_t CCompressedStockholmFile::store_uint(size_t x, bool fixed_size)
+ {
+ 	uint8_t n_bytes = 0;
+ 
+ 	if (fixed_size)
+-		n_bytes = sizeof(size_t);
++		n_bytes = sizeof(uint64_t);
+ 	else
+ 	{
+ 		// Find no. of bytes necessary to store for x
+@@ -415,22 +499,29 @@
+ }
+ 
+ // *******************************************************************************************
+-// Load single unsigned integer from the compressed stream
++// Load single unsigned integer from the compressed stream (little endian)
++// Returns no. of bytes read or 0 on error
+ size_t CCompressedStockholmFile::load_uint(size_t &x, bool fixed_size)
+ {
+ 	uint32_t shift = 0;
+ 	x = 0;
+ 
+-	uint32_t n_bytes;
++	int n_bytes;
+ 	
+ 	if (fixed_size)
+-		n_bytes = sizeof(size_t);
++		n_bytes = sizeof(uint64_t);
+ 	else
+ 		n_bytes = getc(f);
+ 
+-	for (uint32_t i = 0; i < n_bytes; ++i)
++	if (n_bytes < 0 || n_bytes > (int) sizeof(uint64_t))
++		return 0;
++
++	for (int i = 0; i < n_bytes; ++i)
+ 	{
+-		x += ((size_t) getc(f)) << shift;
++		int c = getc(f);
++		if (c == EOF)
++			return 0;
++		x += ((size_t) c) << shift;
+ 		shift += 8;
+ 	}
+ 
+@@ -458,31 +549,32 @@
+ 
+ 	store_uint(footer_size, true);
+ 
+-	return true;
++	return !ferror(f);
+ }
+ 
+ // *******************************************************************************************
+ // Load compressed block
+ bool CCompressedStockholmFile::Load(vector<uint8_t> &v_compressed_data)
+ {
+-	if (!f)
++	if (!f || file_pos + sizeof(uint64_t) > logical_file_size)
+ 		return false;
+ 
+ 	size_t size;
+ 
+-	fread(&size, sizeof(size_t), 1, f);
++	if (!load_uint(size, true))
++		return false;
+ 
+-	if (feof(f))
++	if (size > logical_file_size - file_pos - sizeof(uint64_t))
+ 		return false;
+ 
+-	file_pos += sizeof(size_t) + size;
++	file_pos += sizeof(uint64_t) + size;
+ 
+ 	v_compressed_data.resize(size);
+ 	return fread(v_compressed_data.data(), 1, size, f) == size;
+ }
+ 
+ // *******************************************************************************************
+-void CCompressedStockholmFile::preload_family_descriptions(size_t footer_size)
++bool CCompressedStockholmFile::preload_family_descriptions(size_t footer_size)
+ {
+ 	v_fam_desc.clear();
+ 
+@@ -491,25 +583,33 @@
+ 	while (i < footer_size)
+ 	{
+ 		stockholm_family_desc_t fd;
++		size_t r;
++
++		for (auto px : { &fd.n_sequences, &fd.n_columns, &fd.raw_size, &fd.compressed_size, &fd.compressed_data_ptr })
++		{
++			if ((r = load_uint(*px)) == 0)
++				return false;
++			i += r;
++		}
+ 
+-		i += load_uint(fd.n_sequences);
+-		i += load_uint(fd.n_columns);
+-		i += load_uint(fd.raw_size);
+-		i += load_uint(fd.compressed_size);
+-		i += load_uint(fd.compressed_data_ptr);
+-
+-		fd.ID.clear();
+-		for (int c = 0; (c = getc(f)) > 0; )
+-			fd.ID.push_back((char)c);
+-		i += fd.ID.size() + 1;
+-
+-		fd.AC.clear();
+-		for (int c = 0; (c = getc(f)) > 0; )
+-			fd.AC.push_back((char)c);
+-		i += fd.AC.size() + 1;
++		if (fd.compressed_data_ptr >= logical_file_size)
++			return false;
++
++		for (auto ps : { &fd.ID, &fd.AC })
++		{
++			ps->clear();
++			int c;
++			while ((c = getc(f)) > 0)
++				ps->push_back((char)c);
++			if (c == EOF)
++				return false;
++			i += ps->size() + 1;
++		}
+ 
+ 		v_fam_desc.push_back(fd);
+ 	}
++
++	return i == footer_size;
+ }
+ 
+ // *******************************************************************************************
+@@ -522,4 +622,4 @@
+ }
+ 
+ 
+-// EOF
+\ No newline at end of file
++// EOF
+diff -ruN -x '*.o' -x CoMSA -x libs -x lzma -x '*.vcxproj*' -x sample CoMSA-1.1/src/stockholm.h CoMSA-1.1.fixed/src/stockholm.h
+--- CoMSA-1.1/src/stockholm.h	2018-04-12 01:17:30.000000000 -0700
++++ CoMSA-1.1.fixed/src/stockholm.h	2026-10-29 13:34:37.529357209 -0700
+@@ -23,12 +23,16 @@
+ 	CInFile *in;
+ 	COutFile *out;
+ 	bool mode_reading;
++	string file_name;
++	size_t family_no;
++	bool failed;
+ 
+ 	bool read_line(vector<uint8_t> &vu);
+ 	string trim(string s);
++	bool validate_family(vector<string> &v_names, vector<string> &v_sequences, const string &ID);
+ 
+ public:
+-	CStockholmFile() : in(nullptr), out(nullptr)
++	CStockholmFile() : in(nullptr), out(nullptr), family_no(0), failed(false)
+ 	{};
+ 
+ 	~CStockholmFile()
+@@ -46,6 +50,12 @@
+ 	bool Eof();
+ 	size_t GetPos();
+ 
++	// True if the last GetSequences() call found an invalid family
++	bool Failed()
++	{
++		return failed;
++	}
++
+ 	bool GetSequences(vector<vector<uint8_t>> &v_meta, vector<uint32_t> &v_offsets, vector<string> &v_names, vector<string> &v_sequences,
+ 		string &ID, string &AC);
+ 	bool PutSequences(vector<vector<uint8_t>> &v_meta, vector<uint32_t> &v_offsets, vector<string> &v_names, vector<string> &v_sequences);
+@@ -63,12 +73,14 @@
+ 
+ 	vector<stockholm_family_desc_t> v_fam_desc;
+ 
++	bool writing;
++
+ 	size_t store_uint(size_t x, bool fixed_size = false);
+ 	size_t load_uint(size_t &x, bool fixed_size = false);
+-	void preload_family_descriptions(size_t footer_size);
++	bool preload_family_descriptions(size_t footer_size);
+ 
+ public:
+-	CCompressedStockholmFile() : f(nullptr)
++	CCompressedStockholmFile() : f(nullptr), file_pos(0), logical_file_size(0), writing(false)
+ 	{};
+ 
+ 	~CCompressedStockholmFile()
+@@ -77,7 +89,7 @@
+ 			fclose(f);
+ 	}
+ 
+-	bool OpenForReading(string file_name);
++	bool OpenForReading(string file_name, size_t buffer_size = 128 << 20);
+ 	bool OpenForWriting(string file_name);
+ 	bool Close();
+ 
+diff -ruN -x '*.o' -x CoMSA -x libs -x lzma -x '*.vcxproj*' -x sample CoMSA-1.1/src/transpose.cpp CoMSA-1.1.fixed/src/transpose.cpp
+--- CoMSA-1.1/src/transpose.cpp	2018-04-12 01:17:30.000000000 -0700
++++ CoMSA-1.1.fixed/src/transpose.cpp	2026-10-29 13:30:42.037392326 -0700
+@@ -23,12 +23,13 @@
+ 	size_t in_n_columns = v_sequences->front().size();
+ 	size_t in_n_rows = v_sequences->size();
+ 
+-	// Check whether all sequences are of the same length
++	// All sequences must be of the same length (checked by CMSACompress::Compress)
+ 	for (auto &x : *v_sequences)
+ 		if (x.size() != in_n_columns)
+ 		{
+-			cerr << "Sequences are of different lengths\n";
+-			exit(1);
++			failed = true;
++			in_out->MarkCompleted();
++			return;
+ 		}
+ 
+ 	const int BLOCK_SIZE = 64;
+@@ -53,7 +54,10 @@
+ 		}
+ 
+ 		for (int ii = i; ii > i_end; --ii)
+-			in_out->Push(priority++, v_str[ii % BLOCK_SIZE]);
++		{
++			in_out->Push(priority++, std::move(v_str[ii % BLOCK_SIZE]));
++			v_str[ii % BLOCK_SIZE].resize(in_n_rows);
++		}
+ 	}
+ 
+ 	in_out->MarkCompleted();
+@@ -85,6 +89,13 @@
+ 		if (!in_out->Pop(priority, src))
+ 			continue;
+ 
++		// More columns or a column of wrong size can appear only for corrupted data
++		if (i < 0 || src.size() != n_sequences)
++		{
++			failed = true;
++			continue;
++		}
++
+ 		v_src[i % BLOCK_SIZE] = move(src);
+ 
+ 		if (i % BLOCK_SIZE == 0)
+@@ -104,6 +115,9 @@
+ 		--i;
+ 	}
+ 
++	if (i != -1)
++		failed = true;			// Too few columns
++
+ 	matrix->Push(0, v_sequences);
+ 	matrix->MarkCompleted();
+ }
+diff -ruN -x '*.o' -x CoMSA -x libs -x lzma -x '*.vcxproj*' -x sample CoMSA-1.1/src/transpose.h CoMSA-1.1.fixed/src/transpose.h
+--- CoMSA-1.1/src/transpose.h	2018-04-12 01:17:30.000000000 -0700
++++ CoMSA-1.1.fixed/src/transpose.h	2026-10-29 13:30:42.037392326 -0700
+@@ -24,19 +24,25 @@
+ 	size_t n_sequences;
+ 	size_t n_columns;
+ 	bool forward_mode;
++	bool failed;
+ 
+ 	void forward();
+ 	void reverse();
+ 
+ public:
+ 	CTranspose(CRegisteringPriorityQueue<vector<string>*> *_matrix, CRegisteringPriorityQueue<string> *_in_out, size_t _n_sequences, size_t _n_columns, bool _forward_mode) :
+-		matrix(_matrix), in_out(_in_out), n_sequences(_n_sequences), n_columns(_n_columns), forward_mode(_forward_mode)
++		matrix(_matrix), in_out(_in_out), n_sequences(_n_sequences), n_columns(_n_columns), forward_mode(_forward_mode), failed(false)
+ 	{
+ 		if (!matrix || !in_out)
+ 			throw "No I/O queues";
+ 	}
+ 
+ 	void operator()();
++
++	bool Failed() const
++	{
++		return failed;
++	}
+ };
+ 
+ // EOF
+diff -ruN -x '*.o' -x CoMSA -x libs -x lzma -x '*.vcxproj*' -x sample CoMSA-1.1/src/wfc.cpp CoMSA-1.1.fixed/src/wfc.cpp
+--- CoMSA-1.1/src/wfc.cpp	2018-04-12 01:17:30.000000000 -0700
++++ CoMSA-1.1.fixed/src/wfc.cpp	2026-10-29 13:30:30.702682807 -0700
+@@ -12,6 +12,9 @@
+ #include <unordered_map>
+ #include <numeric>
+ #include <cmath>
++#include <map>
++#include <mutex>
++#include <tuple>
+ 
+ // *******************************************************************************************
+ // Round down to the nearest power of 2
+@@ -110,11 +113,28 @@
+ // Initialize necessary vectors
+ void CWFCCore::initialize()
+ {
+-	v_updates.clear();
+-	v_div_values.clear();
++	// The table depends only on the constructor parameters, so it is built once per parameter set
++	static mutex mtx;
++	static map<tuple<int, int, double, double>, vector<pair<int, int32_t>>> m_tables;
++
++	lock_guard<mutex> lck(mtx);
++	auto key = make_tuple(func_id, max_time, p, q);
++	auto it = m_tables.find(key);
+ 
+-	init_deo();
+-	disretize();
++	if (it == m_tables.end())
++	{
++		v_updates.clear();
++		v_div_values.clear();
++
++		init_deo();
++		disretize();
++
++		v_div_values.clear();
++		v_div_values.shrink_to_fit();
++		m_tables[key] = v_updates;
++	}
++	else
++		v_updates = it->second;
+ 
+ 	v_cur_updates_size = 0;
+ }
+@@ -325,7 +345,7 @@
+ 			dest[pos++] = x;
+ 		}
+ 
+-		out->Push(priority, dest);
++		out->Push(priority, std::move(dest));
+ 	}
+ 
+ 	out->MarkCompleted();
+@@ -359,7 +379,7 @@
+ 			dest[pos++] = x;
+ 		}
+ 
+-		out->Push(priority, dest);
++		out->Push(priority, std::move(dest));
+ 	}
+ 
+ 	out->MarkCompleted();
+@@ -393,7 +413,7 @@
+ 			dest[pos++] = c;
+ 		}
+ 
+-		out->Push(priority, dest);
++		out->Push(priority, std::move(dest));
+ 	}
+ 
+ 	out->MarkCompleted();
+@@ -427,7 +447,7 @@
+ 			dest[pos++] = c;
+ 		}
+ 
+-		out->Push(priority, dest);
++		out->Push(priority, std::move(dest));
+ 	}
+ 
+ 	out->MarkCompleted();
+@@ -437,19 +457,7 @@
+ // Do processing
+ void CWFC::operator()()
+ {
+-	v_legal_symbols.clear();
+-
+-	v_legal_symbols.push_back('-');
+-	v_legal_symbols.push_back('.');
+-	for(int c = 'A'; c <= 'Z'; ++c)
+-		v_legal_symbols.push_back(c);
+-	for (int c = 'a'; c <= 'z'; ++c)
+-		v_legal_symbols.push_back(c);
+-	v_legal_symbols.push_back('*');
+-
+-	for (int i = 0; i < 128; ++i)
+-		if (count(v_legal_symbols.begin(), v_legal_symbols.end(), i) == 0)
+-			v_legal_symbols.push_back(i);
++	v_legal_symbols = legal_symbol_order();
+ 
+ 	if (stage_mode == stage_mode_t::forward)
+ 		forward();

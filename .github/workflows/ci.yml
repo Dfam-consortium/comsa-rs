@@ -1,0 +1,34 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, macos-latest]
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust stable
+        run: rustup update stable && rustup component add clippy
+
+      - name: Clippy
+        run: cargo clippy --release --all-targets -- -D warnings
+
+      - name: Test
+        run: make test
+
+      # The C++ patch must still apply cleanly to the CoMSA v1.1 release.
+      - name: Check CoMSA 1.1 patch applies
+        if: runner.os == 'Linux'
+        run: |
+          curl -sL -o comsa-v1.1.tar.gz https://github.com/refresh-bio/CoMSA/archive/refs/tags/v1.1.tar.gz
+          tar xzf comsa-v1.1.tar.gz
+          cd CoMSA-1.1 && patch -p1 --dry-run < ../patches/comsa-1.1-fixes.patch

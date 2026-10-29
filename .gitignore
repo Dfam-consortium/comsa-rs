@@ -1,0 +1,23 @@
+# Rust build output
+/target/
+
+# Release staging produced by `make dist`
+/stage/
+/comsa-*.tar.gz
+
+# Archives and decompressed output from local experiments
+*.smsac
+*.msac
+*.dec
+
+# Downloaded test data and working files of the validation scripts
+/validation/data/
+/validation/work/
+
+# Editor/backup files
+*~
+*.swp
+.DS_Store
+
+# Maintainer notes, kept local
+how-to-release

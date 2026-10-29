@@ -1,0 +1,127 @@
+name: Release
+
+on:
+  push:
+    tags:
+      # Both "0.1.0" and "v0.1.0" are accepted; the leading "v" is stripped when
+      # comparing against Cargo.toml.
+      - '[0-9]+.[0-9]+.[0-9]+*'
+      - 'v[0-9]+.[0-9]+.[0-9]+*'
+  # Manual trigger for a build-only smoke test: the archives are attached to the
+  # workflow run as artifacts, and the release job is skipped (it is tag-gated).
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-22.04
+          - target: aarch64-apple-darwin
+            os: macos-latest
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust stable
+        run: rustup update stable
+
+      # Each runner builds natively for its own host, so no --target is passed and
+      # `make` finds the binary where it expects it (target/release/).
+      - name: Verify host triple matches the matrix target
+        shell: bash
+        run: |
+          HOST="$(rustc -vV | sed -n 's/^host: //p')"
+          if [ "${HOST}" != "${{ matrix.target }}" ]; then
+            echo "runner host triple ${HOST} != matrix target ${{ matrix.target }}" >&2
+            exit 1
+          fi
+
+      # A tag that disagrees with Cargo.toml would publish an archive whose name
+      # contradicts its contents.
+      - name: Check tag against Cargo.toml version
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        run: |
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          MAKE_VERSION="$(make version)"
+          if [ "${TAG_VERSION}" != "${MAKE_VERSION}" ]; then
+            echo "tag ${GITHUB_REF_NAME} implies version ${TAG_VERSION}," >&2
+            echo "but Cargo.toml says ${MAKE_VERSION}." >&2
+            echo "Bump Cargo.toml and re-tag, or tag the right commit." >&2
+            exit 1
+          fi
+
+      - name: Test
+        run: make test
+
+      # `make dist` runs the release build and stages the same versioned hierarchy
+      # that `make install` produces. COPYFILE_DISABLE keeps macOS tar from adding
+      # ._ AppleDouble entries.
+      - name: Build and package
+        shell: bash
+        env:
+          COPYFILE_DISABLE: '1'
+        run: |
+          make dist PREFIX=/staging DESTDIR="${PWD}/stage"
+          VERSION="$(make version)"
+          ARCHIVE="comsa-${VERSION}-${{ matrix.target }}.tar.gz"
+          mv "comsa-${VERSION}.tar.gz" "${ARCHIVE}"
+          echo "ARCHIVE=${ARCHIVE}" >> "${GITHUB_ENV}"
+
+      - name: Smoke-test the packaged binary
+        shell: bash
+        run: |
+          VERSION="$(make version)"
+          BIN="stage/staging/comsa-${VERSION}/bin/comsa"
+          OUT="$("${BIN}" --version)"
+          echo "${OUT}"
+          if [ "${OUT}" != "comsa ${VERSION}" ]; then
+            echo "comsa reports '${OUT}', expected 'comsa ${VERSION}'" >&2
+            exit 1
+          fi
+          # Round trip a small family, and check that invalid input is rejected.
+          printf '# STOCKHOLM 1.0\n#=GF ID test\n#=GF AC TS0001.1\ns1/1-4  AC-GT\ns2/1-4  AC-GA\n#=GC RF xxxxx\n//\n' > t.sto
+          "${BIN}" Sc t.sto t.smsac
+          "${BIN}" Sd t.smsac t.dec
+          cmp t.sto t.dec
+          printf '# STOCKHOLM 1.0\ns1 AC}GT\n//\n' > bad.sto
+          if "${BIN}" Sc bad.sto bad.smsac; then
+            echo "invalid input was accepted" >&2
+            exit 1
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.target }}
+          path: ${{ env.ARCHIVE }}
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${{ github.ref_name }}" \
+            --title "comsa ${{ github.ref_name }}" \
+            --generate-notes \
+            artifacts/*

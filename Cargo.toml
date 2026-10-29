@@ -1,0 +1,27 @@
+[package]
+name = "comsa"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Compressor for multiple sequence alignments (Stockholm and aligned FASTA); Rust port of CoMSA 1.1"
+license = "GPL-3.0-only"
+readme = "README.md"
+repository = "https://github.com/Dfam-consortium/comsa-rs"
+keywords = ["bioinformatics", "compression", "alignment", "stockholm", "dfam"]
+categories = ["compression", "science", "command-line-utilities"]
+exclude = ["validation/", "patches/", ".github/"]
+
+[lib]
+name = "comsa"
+path = "src/lib.rs"
+
+[[bin]]
+name = "comsa"
+path = "src/main.rs"
+
+[dependencies]
+liblzma = { version = "0.4", default-features = false, features = ["static"] }
+
+[profile.release]
+lto = true
+codegen-units = 1
